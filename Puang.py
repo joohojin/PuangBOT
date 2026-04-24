@@ -16,6 +16,7 @@ import shutil
 import json
 import math
 from discord.ext import tasks
+from mcrcon import MCRcon
 
 # ==========================================
 # 🌟 [신규] FFmpeg 자동 다운로드 시스템
@@ -61,6 +62,9 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 OWNER_ID = 495511094434201600  # ⚠️ 오너 ID 유지됨
+
+# [설정] server.properties에 적었던 비밀번호
+RCON_PASSWORD = "puang6974"
 
 # 🌟 경험치 데이터 저장용 파일 이름
 XP_FILE = "puang_xp.json"
@@ -521,6 +525,21 @@ async def my_info(interaction: discord.Interaction):
     embed.add_field(name="다음 레벨까지", value=f"{bar_str} ({int(progress*100)}%)", inline=False)
 
     await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="마크명령", description="[관리자] 마인크래프트 서버에 명령어를 전송합니다.")
+@app_commands.describe(command="실행할 명령어 (예: list, stop, say Hello)")
+async def mc_command(interaction: discord.Interaction, command: str):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ 관리자만 가능합니다.", ephemeral=True)
+        return
+
+    try:
+        # 마크 서버(RCON)에 접속해서 명령어를 쏘고 대답을 받아옵니다.
+        with MCRcon("127.0.0.1", RCON_PASSWORD, port=25575) as mcr:
+            response = mcr.command(command)
+            await interaction.response.send_message(f"💻 **서버 응답:**\n```\n{response}\n```")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 서버 연결 실패: {e}", ephemeral=True)
 
 # 봇 실행
 with open('token.txt', 'r') as f:

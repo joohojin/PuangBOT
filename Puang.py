@@ -13,6 +13,9 @@ import platform
 import urllib.request
 import zipfile
 import shutil
+import json
+import math
+from discord.ext import tasks
 
 # ==========================================
 # 🌟 [신규] FFmpeg 자동 다운로드 시스템
@@ -59,6 +62,9 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 OWNER_ID = 495511094434201600  # ⚠️ 오너 ID 유지됨
 
+# 🌟 경험치 데이터 저장용 파일 이름
+XP_FILE = "puang_xp.json"
+
 FFMPEG_FILTERS = {
     'normal': '',
     'bassboost': 'bass=g=20,dynaudnorm=f=200',
@@ -90,6 +96,55 @@ class GuildState:
         self.skip_votes = set() 
 
 guild_states = {}
+
+def load_xp():
+    try:
+        with open(XP_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def save_xp(data):
+    with open(XP_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+def get_required_xp(level):
+    # 레벨이 오를수록 기하급수적으로 증가하는 요구 경험치 곡선
+    return int(100 * (level ** 1.5))
+
+async def add_xp(user: discord.Member, amount: int, channel: discord.TextChannel = None):
+    if user.bot: return
+
+    data = load_xp()
+    uid = str(user.id)
+
+    # 신규 유저 초기화
+    if uid not in data:
+        data[uid] = {"xp": 0, "level": 1}
+
+    data[uid]["xp"] += amount
+    current_level = data[uid]["level"]
+    required_xp = get_required_xp(current_level)
+
+    # 레벨업 판정
+    if data[uid]["xp"] >= required_xp:
+        data[uid]["level"] += 1
+        data[uid]["xp"] -= required_xp  # 초과 경험치 이월
+        new_level = data[uid]["level"]
+        save_xp(data)
+
+        # 레벨업 축하 메시지 출력
+        if channel:
+            await channel.send(f"🎉 빰빠밤! {user.mention}님이 **레벨 {new_level}**(으)로 올랐습니다! 푸앙푸앙!")
+            
+        # 💡 [역할 부여 로직] 디스코드 서버에 'Lv.10', 'Lv.20' 같은 역할이 미리 만들어져 있어야 합니다.
+        # role_name = f"Lv.{new_level}"
+        # role = discord.utils.get(user.guild.roles, name=role_name)
+        # if role:
+        #     try: await user.add_roles(role)
+        #     except: pass
+    else:
+        save_xp(data)
 
 def get_state(guild_id):
     if guild_id not in guild_states:
@@ -265,8 +320,32 @@ async def play_next(guild_id, interaction_channel):
 @bot.event
 async def on_ready():
     await bot.tree.sync()
+    voice_xp_loop.start() # 봇이 켜지면 음성 채널 경험치 지급 루프 시작
     await bot.change_presence(status=discord.Status.online, activity=discord.Game("🎵 서버 무중단 운영 중"))
-    print(f'✅ 푸앙봇 로그인 완료! 푸앙푸앙: {bot.user}')
+    print(f'✅ 푸앙봇 V4.0 로그인 완료! 푸앙푸앙: {bot.user}')
+
+# 💡 채팅을 치면 경험치 획득 (글자 수에 비례하되 최대 20 제한)
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot: return
+
+    gained_xp = min(20, max(5, len(message.content)))
+    await add_xp(message.author, gained_xp, message.channel)
+
+    await bot.process_commands(message)
+
+# 💡 음성 채널에 머물면 경험치 획득 (5분마다 실행되는 백그라운드 태스크)
+@tasks.loop(minutes=5.0)
+async def voice_xp_loop():
+    for guild in bot.guilds:
+        for vc in guild.voice_channels:
+            # 음성 채널에 봇을 제외하고 사람이 있다면
+            members = [m for m in vc.members if not m.bot]
+            if members:
+                for member in members:
+                    # 음악을 듣거나 통화 중인 유저에게 꾸준히 30 XP 지급
+                    # (여기서는 채팅창 도배 방지를 위해 채널 객체를 넘기지 않아 레벨업 메시지는 생략됩니다)
+                    await add_xp(member, 30)
 
 @bot.tree.command(name="업데이트", description="[개발자 전용] 깃허브에서 코드를 받아오고 봇을 재시작합니다.")
 async def update_bot(interaction: discord.Interaction):
@@ -415,6 +494,33 @@ async def print_ascii(interaction: discord.Interaction):
         await interaction.response.send_message("❌ puang-art.txt 파일을 찾을 수 없습니다.")
     except Exception as e:
         await interaction.response.send_message(f"❌ 오류 발생: {e}")
+
+@bot.tree.command(name="내정보", description="현재 나의 레벨과 경험치를 확인합니다.")
+async def my_info(interaction: discord.Interaction):
+    data = load_xp()
+    uid = str(interaction.user.id)
+
+    if uid not in data:
+        await interaction.response.send_message("📊 아직 획득한 경험치가 없습니다. 채팅을 치거나 음악을 들어보세요!", ephemeral=True)
+        return
+
+    level = data[uid]["level"]
+    xp = data[uid]["xp"]
+    req_xp = get_required_xp(level)
+
+    # 시각적인 진행률 바(Progress Bar) 계산
+    progress = xp / req_xp
+    bars = 15
+    filled = int(progress * bars)
+    bar_str = "🟩" * filled + "⬜" * (bars - filled)
+
+    embed = discord.Embed(title=f"📈 {interaction.user.display_name}님의 프로필", color=discord.Color.blue())
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    embed.add_field(name="현재 레벨", value=f"**Lv.{level}**", inline=True)
+    embed.add_field(name="경험치 (XP)", value=f"`{xp} / {req_xp}`", inline=True)
+    embed.add_field(name="다음 레벨까지", value=f"{bar_str} ({int(progress*100)}%)", inline=False)
+
+    await interaction.response.send_message(embed=embed)
 
 # 봇 실행
 with open('token.txt', 'r') as f:

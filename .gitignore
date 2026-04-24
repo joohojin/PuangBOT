@@ -2,8 +2,9 @@
 __pycache__/
 *.pyc
 
-# 봇 보안 토큰 (절대 올라가면 안됨)
+# 봇 보안 토큰 및 경험치 (절대 올라가면 안됨)
 token.txt
+puang_xp.json
 
 # FFmpeg 및 자동 다운로드 임시 파일들
 ffmpeg.exe

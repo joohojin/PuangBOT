@@ -386,7 +386,7 @@ async def play(interaction: discord.Interaction, search: str):
         print(f"재생 에러: {e}")
         await interaction.followup.send("❌ 노래를 찾을 수 없거나 오류가 발생했어요.")
 
-@bot.tree.command(name="푸앙", description="푸앙봇의 시그니처 텍스트 아트를 출력합니다.")
+@bot.tree.command(name="미니푸앙", description="푸앙봇의 시그니처 텍스트 아트를 출력합니다.")
 async def print_ascii(interaction: discord.Interaction):
     try:
         # puang.txt 파일을 읽어옵니다. (인코딩 에러 방지를 위해 utf-8 지정)
@@ -398,6 +398,21 @@ async def print_ascii(interaction: discord.Interaction):
         
     except FileNotFoundError:
         await interaction.response.send_message("❌ puang.txt 파일을 찾을 수 없습니다.")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 오류 발생: {e}")
+
+@bot.tree.command(name="빅푸앙", description="푸앙봇의 빅-시그니처 텍스트 아트를 출력합니다.")
+async def print_ascii(interaction: discord.Interaction):
+    try:
+        # puang.txt 파일을 읽어옵니다. (인코딩 에러 방지를 위해 utf-8 지정)
+        with open("puang-art.txt", "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        # 디스코드 메시지 제한을 고려하여 안전하게 출력 (글꼴 깨짐 방지용 코드블록)
+        await interaction.response.send_message(f"```{content}```")
+        
+    except FileNotFoundError:
+        await interaction.response.send_message("❌ puang-art.txt 파일을 찾을 수 없습니다.")
     except Exception as e:
         await interaction.response.send_message(f"❌ 오류 발생: {e}")
 

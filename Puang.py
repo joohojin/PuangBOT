@@ -316,7 +316,8 @@ async def play(interaction: discord.Interaction, search: str):
         'noplaylist': True,
         'quiet': True,
         'default_search': 'auto',
-        'source_address': '0.0.0.0'
+        'source_address': '0.0.0.0',
+        'extractor_args': {'youtube': {'player_client': ['web']}} # 👈 이 줄을 추가해 보세요!
     }
 
     try:

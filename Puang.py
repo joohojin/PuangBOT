@@ -243,7 +243,7 @@ async def play_next(guild_id, interaction_channel):
 async def on_ready():
     await bot.tree.sync()
     await bot.change_presence(status=discord.Status.online, activity=discord.Game("🎵 서버 무중단 운영 중"))
-    print(f'✅ 푸앙봇 V4.0 (자동설치 완벽판) 로그인 완료: {bot.user}')
+    print(f'✅ 푸앙봇 로그인 완료! 푸앙푸앙: {bot.user}')
 
 @bot.tree.command(name="업데이트", description="[개발자 전용] 깃허브에서 코드를 받아오고 봇을 재시작합니다.")
 async def update_bot(interaction: discord.Interaction):
@@ -255,8 +255,15 @@ async def update_bot(interaction: discord.Interaction):
     try:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: subprocess.run(["git", "pull"], check=True, capture_output=True, text=True))
+        
         await interaction.followup.send("✅ **업데이트 완료!** 봇을 재시작합니다.\n```\n" + result.stdout + "\n```")
-        os.execv(sys.executable, ['python', 'Puang.py'])
+        
+        # 🌟 해결 1: 디스코드에 메시지가 완전히 전송될 수 있도록 1초 대기합니다.
+        await asyncio.sleep(1)
+        
+        # 🌟 해결 2: 현재 실행 중인 파이썬과 파일의 절대 경로를 추적하여 강제로 완벽하게 재실행합니다.
+        os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0])])
+        
     except subprocess.CalledProcessError as e:
         await interaction.followup.send(f"❌ **Git Pull 실패:**\n```\n{e.stderr}\n```")
     except FileNotFoundError:

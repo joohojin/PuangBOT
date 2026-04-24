@@ -87,6 +87,7 @@ class GuildState:
         self.filter = 'normal'   
         self.start_time = 0      
         self.controller_msg = None 
+        self.skip_votes = set() 
 
 guild_states = {}
 
@@ -145,11 +146,32 @@ class MusicController(discord.ui.View):
     @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.success, row=0)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = interaction.guild.voice_client
-        if vc and (vc.is_playing() or vc.is_paused()):
-            vc.stop()
-            await interaction.response.send_message("⏭️ **스킵!**", ephemeral=True)
-        else:
+        if not vc or not (vc.is_playing() or vc.is_paused()):
             await interaction.response.send_message("스킵할 노래가 없어요.", ephemeral=True)
+            return
+
+        state = get_state(self.guild_id)
+        user = interaction.user
+
+        # 1. DJ 권한 확인 (오너이거나, 이름이 'DJ'인 역할을 가졌거나)
+        is_dj = (user.id == OWNER_ID) or any(role.name.upper() == "DJ" for role in user.roles)
+
+        if is_dj:
+            vc.stop()
+            await interaction.response.send_message("👑 **DJ 권한으로 강제 스킵했습니다!**")
+            return
+
+        # 2. 일반 유저 투표 로직 (봇 제외 현재 채널 인원의 절반 이상 필요)
+        channel_members = [m for m in user.voice.channel.members if not m.bot]
+        required_votes = max(1, (len(channel_members) + 1) // 2)
+
+        state.skip_votes.add(user.id)
+
+        if len(state.skip_votes) >= required_votes:
+            vc.stop()
+            await interaction.response.send_message(f"⏭️ **투표 가결 ({len(state.skip_votes)}/{required_votes})!** 스킵합니다.")
+        else:
+            await interaction.response.send_message(f"🗳️ **스킵 투표:** {len(state.skip_votes)} / {required_votes} (절반 이상 찬성 시 스킵)")
 
     @discord.ui.button(label="반복: 끔", emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
     async def loop_toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -196,6 +218,7 @@ async def play_next(guild_id, interaction_channel):
 
     song = state.queue.pop(0)
     state.current_song = song
+    state.skip_votes.clear()  # 새 노래가 시작되면 투표 초기화
     state.is_playing = True
     state.start_time = time.time()
 
@@ -322,6 +345,7 @@ async def play(interaction: discord.Interaction, search: str):
         'format': 'bestaudio/best',
         'noplaylist': True,
         'quiet': True,
+        'no_warnings': True,
         'default_search': 'auto',
         'source_address': '0.0.0.0',
         'extractor_args': {'youtube': {'player_client': ['android']}}
@@ -361,6 +385,21 @@ async def play(interaction: discord.Interaction, search: str):
     except Exception as e:
         print(f"재생 에러: {e}")
         await interaction.followup.send("❌ 노래를 찾을 수 없거나 오류가 발생했어요.")
+
+@bot.tree.command(name="푸앙", description="푸앙봇의 시그니처 텍스트 아트를 출력합니다.")
+async def print_ascii(interaction: discord.Interaction):
+    try:
+        # puang.txt 파일을 읽어옵니다. (인코딩 에러 방지를 위해 utf-8 지정)
+        with open("puang.txt", "r", encoding="utf-8") as f:
+            content = f.read()
+        
+        # 디스코드 메시지 제한을 고려하여 안전하게 출력 (글꼴 깨짐 방지용 코드블록)
+        await interaction.response.send_message(f"```{content}```")
+        
+    except FileNotFoundError:
+        await interaction.response.send_message("❌ puang.txt 파일을 찾을 수 없습니다.")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 오류 발생: {e}")
 
 # 봇 실행
 with open('token.txt', 'r') as f:

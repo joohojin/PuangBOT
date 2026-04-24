@@ -9,16 +9,56 @@ import datetime
 import os
 import sys
 import subprocess
+import platform
+import urllib.request
+import zipfile
+import shutil
+
+# ==========================================
+# 🌟 [신규] FFmpeg 자동 다운로드 시스템
+# ==========================================
+def check_and_setup_env():
+    print("🔄 [시스템 점검] 봇 구동 환경을 확인합니다...")
+
+    sys_name = platform.system()
+    ffmpeg_name = "ffmpeg.exe" if sys_name == "Windows" else "ffmpeg"
+
+    # 1. 이미 다운받았는지 확인
+    if os.path.exists(ffmpeg_name) or shutil.which("ffmpeg"):
+        print("✅ FFmpeg가 이미 준비되어 있습니다.")
+        return
+
+    # 2. 없다면 자동으로 깃허브에서 다운로드하여 압축 풀기
+    print(f"📥 FFmpeg가 없습니다! 깡통 서버를 위해 자동으로 다운로드합니다 (OS: {sys_name})...")
+    try:
+        if sys_name == "Windows":
+            url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+            zip_path = "ffmpeg_temp.zip"
+            urllib.request.urlretrieve(url, zip_path)
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                for file in zip_ref.namelist():
+                    if file.endswith("ffmpeg.exe"):
+                        with zip_ref.open(file) as source, open(ffmpeg_name, "wb") as target:
+                            target.write(source.read())
+            os.remove(zip_path)
+            print("🎉 FFmpeg 자동 설치 완료!")
+    except Exception as e:
+        print(f"❌ FFmpeg 다운로드 실패: {e}")
+
+# 봇이 켜질 때 무조건 환경 세팅 먼저 실행
+check_and_setup_env()
+
+# 다운받은 FFmpeg의 절대 경로 저장 (재생 오류 원천 차단)
+FFMPEG_PATH = os.path.abspath("ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg")
+# ==========================================
+
 
 # [설정] 봇 기본 설정
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# [권한 설정] 개발자(오너) ID 설정 (원격 업데이트용)
-# 디스코드 설정 -> 고급 -> 개발자 모드 켜기 후, 본인 프로필 우클릭 -> ID 복사
-OWNER_ID = 495511094434201600  # ⚠️ 여기에 본인의 진짜 ID 숫자를 넣으세요!
+OWNER_ID = 495511094434201600  # ⚠️ 오너 ID 유지됨
 
-# [상수] 이펙트 필터 설정
 FFMPEG_FILTERS = {
     'normal': '',
     'bassboost': 'bass=g=20,dynaudnorm=f=200',
@@ -46,7 +86,7 @@ class GuildState:
         self.voice_client = None
         self.filter = 'normal'   
         self.start_time = 0      
-        self.controller_msg = None # 🌟 24/7 최적화: 채팅창 도배 방지용 UI 메시지 추적
+        self.controller_msg = None 
 
 guild_states = {}
 
@@ -58,25 +98,20 @@ def get_state(guild_id):
 def format_time(seconds):
     return str(datetime.timedelta(seconds=int(seconds))) if seconds else "실시간"
 
-# [이벤트] 🌟 24/7 최적화: 메모리 관리 및 자동 퇴장
 @bot.event
 async def on_voice_state_update(member, before, after):
-    # 1. 봇이 강제로 통화방에서 쫓겨나거나 끊겼을 때 메모리(상태) 초기화
     if member == bot.user and before.channel and not after.channel:
         guild_id = before.channel.guild.id
         if guild_id in guild_states:
-            del guild_states[guild_id] # 찌꺼기 메모리 삭제
+            del guild_states[guild_id] 
             
-    # 2. 통화방에 봇 혼자 남았을 때 자동 퇴장 (서버 트래픽 절약)
     if member != bot.user and before.channel:
         if bot.user in before.channel.members:
-            # 봇을 제외한 실제 사람이 0명이면
             if len([m for m in before.channel.members if not m.bot]) == 0:
                 vc = before.channel.guild.voice_client
                 if vc and vc.is_connected():
                     await vc.disconnect()
 
-# [UI] 고급 뮤직 컨트롤러
 class MusicController(discord.ui.View):
     def __init__(self, guild_id):
         super().__init__(timeout=None)
@@ -102,8 +137,6 @@ class MusicController(discord.ui.View):
         state.loop_mode = 0
         if interaction.guild.voice_client:
             interaction.guild.voice_client.stop()
-        
-        # UI 플레이어 메시지도 깔끔하게 지워줌
         if state.controller_msg:
             try: await state.controller_msg.delete()
             except: pass
@@ -124,11 +157,9 @@ class MusicController(discord.ui.View):
         state.loop_mode = (state.loop_mode + 1) % 3
         modes = ["끔", "한 곡", "전체"]
         button.label = f"반복: {modes[state.loop_mode]}"
-        
         if state.loop_mode == 0: button.style = discord.ButtonStyle.secondary
         elif state.loop_mode == 1: button.style = discord.ButtonStyle.primary
         else: button.style = discord.ButtonStyle.success
-        
         await interaction.response.edit_message(view=self)
 
     @discord.ui.button(label="대기열", emoji="📜", style=discord.ButtonStyle.gray, row=1)
@@ -145,7 +176,6 @@ class MusicController(discord.ui.View):
         embed = discord.Embed(title="📜 현재 대기열", description=desc, color=discord.Color.gold())
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# [로직] 다음 곡 재생
 async def play_next(guild_id, interaction_channel):
     state = get_state(guild_id)
     voice = state.voice_client
@@ -158,7 +188,6 @@ async def play_next(guild_id, interaction_channel):
     if not state.queue:
         state.is_playing = False
         state.current_song = None
-        # 끝났을 때 이전 UI 삭제
         if state.controller_msg:
             try: await state.controller_msg.delete()
             except: pass
@@ -174,7 +203,6 @@ async def play_next(guild_id, interaction_channel):
     ffmpeg_opts = {
         'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
         'options': f'-vn -filter:a "{filter_str}"' if filter_str else '-vn'
-        # ⚠️ 만약 서버 환경에 ffmpeg가 환경 변수로 잡혀있다면 executable 옵션은 지우는게 좋습니다!
     }
 
     def after_playing(error):
@@ -185,9 +213,8 @@ async def play_next(guild_id, interaction_channel):
         except: pass
 
     try:
-        import os
-        ffmpeg_path = os.path.abspath("ffmpeg.exe")
-        source = discord.FFmpegPCMAudio(song.url, executable=ffmpeg_path, **ffmpeg_opts)
+        # 🌟 이제 절대 경로를 사용하여 ffmpeg를 무조건 찾아냅니다.
+        source = discord.FFmpegPCMAudio(song.url, executable=FFMPEG_PATH, **ffmpeg_opts)
         source = discord.PCMVolumeTransformer(source, volume=state.volume)
         voice.play(source, after=after_playing)
 
@@ -202,7 +229,6 @@ async def play_next(guild_id, interaction_channel):
 
         view = MusicController(guild_id)
         
-        # 🌟 24/7 최적화: 도배 방지 로직 (이전 플레이어가 있으면 지우고 새로 띄움)
         if state.controller_msg:
             try: await state.controller_msg.delete()
             except: pass
@@ -213,44 +239,28 @@ async def play_next(guild_id, interaction_channel):
         print(f"재생 오류: {e}")
         await play_next(guild_id, interaction_channel)
 
-# ------------------------------------------------------------
-# [명령어] Slash Commands
-# ------------------------------------------------------------
-
 @bot.event
 async def on_ready():
     await bot.tree.sync()
     await bot.change_presence(status=discord.Status.online, activity=discord.Game("🎵 서버 무중단 운영 중"))
-    print(f'✅ 푸앙봇 V4.0 (24/7 에디션) 로그인 완료: {bot.user}')
+    print(f'✅ 푸앙봇 V4.0 (자동설치 완벽판) 로그인 완료: {bot.user}')
 
 @bot.tree.command(name="업데이트", description="[개발자 전용] 깃허브에서 코드를 받아오고 봇을 재시작합니다.")
 async def update_bot(interaction: discord.Interaction):
-    # 권한 검사
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("❌ 오너(개발자)만 사용할 수 있는 명령어입니다.", ephemeral=True)
         return
 
-    # 먼저 대답을 해서 10062 에러 방지
     await interaction.response.send_message("🔄 **원격 업데이트를 시작합니다...**\n(서버에서 `git pull` 중...)")
-    
     try:
-        # 비동기로 시스템 명령어(git) 실행 (봇이 멈추지 않게 함)
         loop = asyncio.get_event_loop()
-        # 오류 상세 내용을 보기 위해 capture_output=True 추가
-        result = await loop.run_in_executor(
-            None, 
-            lambda: subprocess.run(["git", "pull"], check=True, capture_output=True, text=True)
-        )
-        
+        result = await loop.run_in_executor(None, lambda: subprocess.run(["git", "pull"], check=True, capture_output=True, text=True))
         await interaction.followup.send("✅ **업데이트 완료!** 봇을 재시작합니다.\n```\n" + result.stdout + "\n```")
-        
-        # 봇 재시작 로직 (경로 문제 방지)
         os.execv(sys.executable, ['python', 'Puang.py'])
-        
     except subprocess.CalledProcessError as e:
-        await interaction.followup.send(f"❌ **Git Pull 실패 (코드 충돌 또는 권한 문제):**\n```\n{e.stderr}\n```")
+        await interaction.followup.send(f"❌ **Git Pull 실패:**\n```\n{e.stderr}\n```")
     except FileNotFoundError:
-        await interaction.followup.send("❌ **[WinError 2] Git이 설치되어 있지 않거나 환경 변수에 없습니다!**\nGit을 설치하고 PC를 재부팅해주세요.")
+        await interaction.followup.send("❌ **[WinError 2] Git이 설치되어 있지 않거나 환경 변수에 없습니다!**")
     except Exception as e:
         await interaction.followup.send(f"❌ **알 수 없는 에러 발생:**\n```\n{e}\n```")
 
@@ -273,7 +283,7 @@ async def leave(interaction: discord.Interaction):
     if interaction.guild.voice_client:
         guild_id = interaction.guild_id
         if guild_id in guild_states:
-            del guild_states[guild_id] # 퇴장 시 깔끔하게 메모리 정리
+            del guild_states[guild_id] 
         await interaction.guild.voice_client.disconnect()
         await interaction.response.send_message("👋 **빠이빠이!**")
     else:
@@ -343,11 +353,6 @@ async def play(interaction: discord.Interaction, search: str):
     except Exception as e:
         print(f"재생 에러: {e}")
         await interaction.followup.send("❌ 노래를 찾을 수 없거나 오류가 발생했어요.")
-
-@bot.tree.command(name="대기열", description="대기열의 노래를 확인, 이동, 셔플, 삭제합니다.")
-async def queue_manage(interaction: discord.Interaction):
-    # 이 부분은 뷰(버튼)에서 이미 지원하므로 안내 메시지로 대체
-    await interaction.response.send_message("💡 팁: 재생 중인 플레이어 UI의 `📜 대기열` 버튼을 누르면 편하게 볼 수 있습니다!", ephemeral=True)
 
 # 봇 실행
 with open('token.txt', 'r') as f:

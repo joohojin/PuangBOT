@@ -16,7 +16,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # [권한 설정] 개발자(오너) ID 설정 (원격 업데이트용)
 # 디스코드 설정 -> 고급 -> 개발자 모드 켜기 후, 본인 프로필 우클릭 -> ID 복사
-OWNER_ID = 123456789012345678  # ⚠️ 여기에 본인의 진짜 ID 숫자를 넣으세요!
+OWNER_ID = 495511094434201600  # ⚠️ 여기에 본인의 진짜 ID 숫자를 넣으세요!
 
 # [상수] 이펙트 필터 설정
 FFMPEG_FILTERS = {
@@ -185,7 +185,9 @@ async def play_next(guild_id, interaction_channel):
         except: pass
 
     try:
-        source = discord.FFmpegPCMAudio(song.url, **ffmpeg_opts)
+        import os
+        ffmpeg_path = os.path.abspath("ffmpeg.exe")
+        source = discord.FFmpegPCMAudio(song.url, executable=ffmpeg_path, **ffmpeg_opts)
         source = discord.PCMVolumeTransformer(source, volume=state.volume)
         voice.play(source, after=after_playing)
 

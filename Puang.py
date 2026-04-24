@@ -230,17 +230,29 @@ async def update_bot(interaction: discord.Interaction):
         await interaction.response.send_message("❌ 오너(개발자)만 사용할 수 있는 명령어입니다.", ephemeral=True)
         return
 
-    await interaction.response.send_message("🔄 **원격 업데이트를 시작합니다...**\n(서버에서 `git pull` 후 봇을 재시작합니다.)")
+    # 먼저 대답을 해서 10062 에러 방지
+    await interaction.response.send_message("🔄 **원격 업데이트를 시작합니다...**\n(서버에서 `git pull` 중...)")
     
     try:
-        # 1. 터미널 명령어 실행 (Git Pull)
-        # ※ 봇 코드가 Git 폴더 안에 존재하고, origin이 연결되어 있어야 작동합니다.
-        subprocess.run(["git", "pull"], check=True)
+        # 비동기로 시스템 명령어(git) 실행 (봇이 멈추지 않게 함)
+        loop = asyncio.get_event_loop()
+        # 오류 상세 내용을 보기 위해 capture_output=True 추가
+        result = await loop.run_in_executor(
+            None, 
+            lambda: subprocess.run(["git", "pull"], check=True, capture_output=True, text=True)
+        )
         
-        # 2. 파이썬 프로세스 자체 재시작 (마법의 명령어)
-        os.execv(sys.executable, ['python'] + sys.argv)
+        await interaction.followup.send("✅ **업데이트 완료!** 봇을 재시작합니다.\n```\n" + result.stdout + "\n```")
+        
+        # 봇 재시작 로직 (경로 문제 방지)
+        os.execv(sys.executable, ['python', 'Puang.py'])
+        
+    except subprocess.CalledProcessError as e:
+        await interaction.followup.send(f"❌ **Git Pull 실패 (코드 충돌 또는 권한 문제):**\n```\n{e.stderr}\n```")
+    except FileNotFoundError:
+        await interaction.followup.send("❌ **[WinError 2] Git이 설치되어 있지 않거나 환경 변수에 없습니다!**\nGit을 설치하고 PC를 재부팅해주세요.")
     except Exception as e:
-        await interaction.followup.send(f"❌ 업데이트 중 오류가 발생했습니다: \n```\n{e}\n```")
+        await interaction.followup.send(f"❌ **알 수 없는 에러 발생:**\n```\n{e}\n```")
 
 @bot.tree.command(name="입장", description="봇을 현재 음성 채널로 부릅니다.")
 async def join(interaction: discord.Interaction):

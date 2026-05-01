@@ -17,6 +17,14 @@ import json
 import math
 from discord.ext import tasks
 from mcrcon import MCRcon
+# --- [수정: TTS 라이브러리 추가] ---
+from gtts import gTTS
+import uuid
+import os
+
+# TTS 기능을 켠 유저들을 추적하는 명부
+tts_users = set()
+# -----------------------------------
 
 # ==========================================
 # 🌟 [신규] FFmpeg 자동 다운로드 시스템
@@ -114,6 +122,10 @@ class GuildState:
         self.start_time = 0      
         self.controller_msg = None 
         self.skip_votes = set() 
+        # --- [수정: TTS 큐 시스템 추가] ---
+        self.tts_queue = asyncio.Queue()
+        self.tts_task = None
+        # -----------------------------------
 
 guild_states = {}
 
@@ -165,6 +177,54 @@ async def add_xp(user: discord.Member, amount: int, channel: discord.TextChannel
         #     except: pass
     else:
         save_xp(data)
+
+# --- [수정: TTS 처리 백그라운드 엔진] ---
+async def process_tts_queue(guild: discord.Guild):
+    state = get_state(guild.id)
+    vc = guild.voice_client
+    
+    while not state.tts_queue.empty():
+        text = await state.tts_queue.get()
+        
+        if not vc or not vc.is_connected():
+            break
+
+        try:
+            # 1. 텍스트를 mp3 파일로 변환 (고유 이름 부여)
+            tts = gTTS(text=text, lang='ko')
+            filename = f"tts_{uuid.uuid4().hex}.mp3"
+            tts.save(filename)
+            
+            # 2. 음악 재생 중첩 문제 해결 (음악 임시 정지)
+            was_playing_music = False
+            if vc.is_playing():
+                was_playing_music = True
+                vc.pause() # 음악 멈춰!
+            
+            # 3. 재생 완료 후 파일을 지우는 정리 함수
+            def cleanup(error):
+                try: os.remove(filename)
+                except: pass
+
+            # 4. TTS 재생
+            tts_source = discord.FFmpegPCMAudio(filename, executable=FFMPEG_PATH)
+            # 볼륨을 약간 키워줍니다
+            tts_source = discord.PCMVolumeTransformer(tts_source, volume=1.0) 
+            vc.play(tts_source, after=cleanup)
+            
+            # 5. TTS가 끝날 때까지 대기
+            while vc.is_playing():
+                await asyncio.sleep(0.5)
+                
+            # 6. 아까 음악이 재생 중이었다면 다시 재생 (Resume)
+            if was_playing_music:
+                vc.resume()
+
+        except Exception as e:
+            print(f"TTS 에러: {e}")
+            try: os.remove(filename)
+            except: pass
+# -----------------------------------
 
 def get_state(guild_id):
     if guild_id not in guild_states:
@@ -349,6 +409,25 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot: return
 
+    # --- [수정: TTS 감지 로직 추가] ---
+    if message.author.id in tts_users and message.author.voice:
+        guild_id = message.guild.id
+        state = get_state(guild_id)
+        
+        # 봇이 음성 채널에 없으면 유저가 있는 곳으로 먼저 들어감
+        if not message.guild.voice_client:
+            await message.author.voice.channel.connect(timeout=20.0, self_deaf=True)
+            state.voice_client = message.guild.voice_client
+            
+        # "닉네임님이 말합니다"를 붙여서 큐에 삽입
+        text_to_read = f"{message.author.display_name}님의 말. {message.content}"
+        await state.tts_queue.put(text_to_read)
+        
+        # 엔진이 안 돌아가고 있다면 시동 걸기
+        if state.tts_task is None or state.tts_task.done():
+            state.tts_task = asyncio.create_task(process_tts_queue(message.guild))
+    # -----------------------------------
+
     gained_xp = min(20, max(5, len(message.content)))
     await add_xp(message.author, gained_xp, message.channel)
 
@@ -494,6 +573,22 @@ async def close_tunnel(interaction: discord.Interaction):
             await interaction.followup.send("❌ 윈도우 환경에서만 지원되는 명령어입니다.")
     except Exception as e:
         await interaction.followup.send(f"❌ 프로세스 종료 실패: {e}")
+
+# --- [수정: TTS 제어 명령어 추가] ---
+@bot.tree.command(name="tts켜기", description="[전체 유저] 채팅을 치면 푸앙이가 음성 채널에서 대신 읽어줍니다.")
+async def tts_on(interaction: discord.Interaction):
+    if not interaction.user.voice:
+        await interaction.response.send_message("❌ 음성 채널에 먼저 접속한 상태에서 사용해주세요!", ephemeral=True)
+        return
+        
+    tts_users.add(interaction.user.id)
+    await interaction.response.send_message("🎙️ **TTS 모드 ON!**\n지금부터 이 채널에 채팅을 치면 푸앙이가 목소리로 읽어줄게요!", ephemeral=True)
+
+@bot.tree.command(name="tts끄기", description="[전체 유저] TTS 기능을 끕니다.")
+async def tts_off(interaction: discord.Interaction):
+    tts_users.discard(interaction.user.id)
+    await interaction.response.send_message("🔇 **TTS 모드 OFF!**", ephemeral=True)
+# -----------------------------------
 
 @bot.tree.command(name="업데이트", description="[개발자 전용] 깃허브에서 코드를 받아오고 봇을 재시작합니다.")
 async def update_bot(interaction: discord.Interaction):

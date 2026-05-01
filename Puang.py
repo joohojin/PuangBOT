@@ -72,11 +72,18 @@ XP_FILE = "puang_xp.json"
 # ==========================================
 # 🛠️ 서버 관리 경로 설정 (상대 경로 기준)
 # ==========================================
-# 봇이 Desktop\ET\PuangBOT 안에 있으므로, 한 단계 위(..)로 가서 이동합니다.
+# 봇 위치: Desktop\ET\PuangBOT\puang.py
+# 기준 위치(Desktop\ET)를 잡기 위해 한 단계 위(..)로 이동합니다.
 BASE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+# 실제 사용자님 폴더명에 맞춘 경로 (serve vs server 주의!)
 MC_ROOT_DIR = os.path.join(BASE_PATH, "serve", "mc")  # Desktop\ET\serve\mc
 PLAYIT_DIR = os.path.join(BASE_PATH, "server")      # Desktop\ET\server
-PLAYIT_LINK = "playit.gg.lnk"                       # 바로가기 파일명
+PLAYIT_LINK = "playit.gg.lnk"                       # 바로가기 파일명 (확장자 .lnk 포함)
+
+# [디버깅] 봇 실행 시 경로가 맞는지 콘솔에 출력합니다.
+print(f"📂 마크 서버 루트 경로: {MC_ROOT_DIR}")
+print(f"🌐 Playit 경로: {PLAYIT_DIR}")
 
 FFMPEG_FILTERS = {
     'normal': '',
@@ -360,20 +367,29 @@ async def voice_xp_loop():
                     # (여기서는 채팅창 도배 방지를 위해 채널 객체를 넘기지 않아 레벨업 메시지는 생략됩니다)
                     await add_xp(member, 30)
 
-# 서버 폴더 리스트를 가져오는 헬퍼 함수
+# ==========================================
+# 🤖 서버 관제 명령어 (자동 완성 포함)
+# ==========================================
+
+# 1. mc 폴더 내의 폴더 리스트를 실시간으로 불러오는 자동 완성 함수
 async def server_list_autocomplete(
     interaction: discord.Interaction,
     current: str,
 ) -> list[app_commands.Choice[str]]:
     if not os.path.exists(MC_ROOT_DIR):
+        print(f"⚠️ 경로를 찾을 수 없음: {MC_ROOT_DIR}")
         return []
+    
+    # mc 폴더 안의 항목 중 '폴더'인 것만 골라냅니다.
     folders = [f for f in os.listdir(MC_ROOT_DIR) if os.path.isdir(os.path.join(MC_ROOT_DIR, f))]
+    
+    # 유저가 입력 중인 글자가 포함된 것만 25개까지 필터링해서 보여줍니다.
     return [
         app_commands.Choice(name=folder, value=folder)
         for folder in folders if current.lower() in folder.lower()
-    ][:25] # 디스코드 제한 25개
+    ][:25]
 
-@bot.tree.command(name="서버켜기", description="[관리자] 선택한 마인크래프트 서버를 실행합니다.")
+@bot.tree.command(name="서버켜기", description="[관리자] mc 폴더 내의 서버를 선택하여 실행합니다.")
 @app_commands.autocomplete(server_name=server_list_autocomplete)
 async def start_selected_server(interaction: discord.Interaction, server_name: str):
     if interaction.user.id != OWNER_ID:
@@ -384,13 +400,13 @@ async def start_selected_server(interaction: discord.Interaction, server_name: s
     bat_path = os.path.join(target_dir, "start.bat")
 
     if not os.path.exists(bat_path):
-        await interaction.response.send_message(f"❌ `{server_name}` 폴더 안에 `start.bat`이 없습니다!", ephemeral=True)
+        await interaction.response.send_message(f"❌ `{server_name}` 폴더에 `start.bat`이 없습니다!", ephemeral=True)
         return
 
-    await interaction.response.send_message(f"🚀 **{server_name}** 서버의 `start.bat`을 실행합니다...")
+    await interaction.response.send_message(f"🚀 **{server_name}** 서버의 `start.bat`을 백그라운드에서 실행합니다...")
     
     try:
-        # 독립된 프로세스로 실행 (윈도우 전용)
+        # 윈도우에서 독립된 프로세스로 실행 (서버가 켜져도 봇이 멈추지 않음)
         subprocess.Popen(
             ["start.bat"],
             cwd=target_dir,
@@ -398,9 +414,9 @@ async def start_selected_server(interaction: discord.Interaction, server_name: s
             shell=True
         )
     except Exception as e:
-        await interaction.followup.send(f"❌ 실행 실패: {e}")
+        await interaction.followup.send(f"❌ 실행 에러: {e}")
 
-@bot.tree.command(name="통로열기", description="[관리자] playit.gg 터널링 서비스를 실행합니다.")
+@bot.tree.command(name="통로열기", description="[관리자] playit.gg 바로가기를 실행합니다.")
 async def open_tunnel(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("❌ 권한이 없습니다.", ephemeral=True)
@@ -409,31 +425,31 @@ async def open_tunnel(interaction: discord.Interaction):
     target_path = os.path.join(PLAYIT_DIR, PLAYIT_LINK)
     
     if not os.path.exists(target_path):
-        await interaction.response.send_message(f"❌ `{target_path}` 파일을 찾을 수 없습니다.", ephemeral=True)
+        await interaction.response.send_message(f"❌ `{target_path}` 파일을 찾을 수 없습니다. 이름(playit.gg.lnk)을 확인해주세요.", ephemeral=True)
         return
 
-    await interaction.response.send_message("🌐 **Playit.gg 터널링을 시작합니다...**")
+    await interaction.response.send_message("🌐 **Playit.gg 통로를 개방합니다...**")
     try:
-        os.startfile(target_path) # 윈도우에서 바로가기(.lnk)를 실행하는 가장 편한 방법
+        os.startfile(target_path) # 윈도우 바로가기 실행
     except Exception as e:
-        await interaction.followup.send(f"❌ 실행 실패: {e}")
+        await interaction.followup.send(f"❌ 실행 에러: {e}")
 
-@bot.tree.command(name="시스템재부팅", description="[관리자] 학교 서버 컴퓨터를 즉시 재부팅합니다.")
+@bot.tree.command(name="시스템재부팅", description="[관리자] 컴퓨터 시스템을 즉시 재시작합니다.")
 async def reboot_system(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("❌ 이 명령어는 매우 위험하여 오너만 가능합니다.", ephemeral=True)
+        await interaction.response.send_message("❌ 위험한 명령어입니다. 오너만 가능합니다.", ephemeral=True)
         return
 
-    await interaction.response.send_message("⚠️ **10초 뒤 시스템이 재부팅됩니다!** 봇이 잠시 오프라인이 됩니다.")
+    await interaction.response.send_message("⚠️ **10초 뒤 컴퓨터를 재부팅합니다.** 저장되지 않은 작업은 종료됩니다.")
     await asyncio.sleep(10)
     
     try:
         if platform.system() == "Windows":
-            os.system("shutdown /r /t 1") # 1초 뒤 재부팅
+            os.system("shutdown /r /t 1") # 1초 뒤 재부팅 명령
         else:
-            await interaction.followup.send("❌ 이 명령어는 윈도우 환경 전용입니다.")
+            await interaction.followup.send("❌ 윈도우 시스템이 아닙니다.")
     except Exception as e:
-        await interaction.followup.send(f"❌ 재부팅 명령 실패: {e}")
+        await interaction.followup.send(f"❌ 명령 실패: {e}")
 
 @bot.tree.command(name="업데이트", description="[개발자 전용] 깃허브에서 코드를 받아오고 봇을 재시작합니다.")
 async def update_bot(interaction: discord.Interaction):

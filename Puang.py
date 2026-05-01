@@ -457,6 +457,44 @@ async def reboot_system(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ 명령 실패: {e}")
 
+@bot.tree.command(name="서버끄기", description="[관리자] 현재 켜져 있는 마인크래프트 서버를 안전하게 종료합니다.")
+async def stop_server(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ 오너만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("🛑 **서버를 안전하게 종료하고 맵 데이터를 저장합니다...**")
+    
+    try:
+        # RCON을 통해 서버에 공식 종료 명령(stop)을 전송합니다.
+        with MCRcon("127.0.0.1", RCON_PASSWORD, port=25575) as mcr:
+            # 학생들에게 5초의 대피 시간을 줍니다!
+            mcr.command("say [푸앙봇] 5초 뒤 서버가 종료됩니다! 데이터가 저장됩니다.")
+            await asyncio.sleep(5)
+            mcr.command("stop")
+            
+        await interaction.followup.send("✅ **서버 종료 명령 전송 완료!** (완전히 꺼질 때까지 잠시 대기해주세요)")
+    except Exception as e:
+        await interaction.followup.send(f"❌ **종료 실패:** 서버가 켜져 있지 않거나 RCON이 연결되지 않았습니다.\n`{e}`")
+
+@bot.tree.command(name="통로끊기", description="[관리자] Playit.gg 터널링 프로세스를 종료합니다.")
+async def close_tunnel(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ 오너만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("🔌 **Playit.gg 터널링 연결을 강제로 끊습니다...**")
+    
+    try:
+        if platform.system() == "Windows":
+            # 윈도우의 taskkill 명령어로 이름에 playit이 들어간 모든 프로세스를 강제(/F) 종료합니다.
+            os.system("taskkill /F /IM playit* /T")
+            await interaction.followup.send("✅ **통로가 성공적으로 닫혔습니다.**")
+        else:
+            await interaction.followup.send("❌ 윈도우 환경에서만 지원되는 명령어입니다.")
+    except Exception as e:
+        await interaction.followup.send(f"❌ 프로세스 종료 실패: {e}")
+
 @bot.tree.command(name="업데이트", description="[개발자 전용] 깃허브에서 코드를 받아오고 봇을 재시작합니다.")
 async def update_bot(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:

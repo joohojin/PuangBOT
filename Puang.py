@@ -70,20 +70,20 @@ RCON_PASSWORD = "puang6974"
 XP_FILE = "puang_xp.json"
 
 # ==========================================
-# 🛠️ 서버 관리 경로 설정 (상대 경로 기준)
+# 🛠️ 서버 관리 경로 설정 (상대 경로 기준 - 수정됨)
 # ==========================================
 # 봇 위치: Desktop\ET\PuangBOT\puang.py
-# 기준 위치(Desktop\ET)를 잡기 위해 한 단계 위(..)로 이동합니다.
+# .. 를 통해 Desktop\ET 폴더로 이동합니다.
 BASE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-# 실제 사용자님 폴더명에 맞춘 경로 (serve vs server 주의!)
-MC_ROOT_DIR = os.path.join(BASE_PATH, "serve", "mc")  # Desktop\ET\serve\mc
-PLAYIT_DIR = os.path.join(BASE_PATH, "server")      # Desktop\ET\server
-PLAYIT_LINK = "playit.gg.lnk"                       # 바로가기 파일명 (확장자 .lnk 포함)
+# 🌟 중요: 스크린샷에 맞춰 'serve'를 'server'로 수정했습니다!
+MC_ROOT_DIR = os.path.join(BASE_PATH, "server", "mc")  # Desktop\ET\server\mc
+PLAYIT_DIR = os.path.join(BASE_PATH, "server")        # Desktop\ET\server
+PLAYIT_LINK = "playit.gg.lnk"                         # 바로가기 파일명
 
-# [디버깅] 봇 실행 시 경로가 맞는지 콘솔에 출력합니다.
-print(f"📂 마크 서버 루트 경로: {MC_ROOT_DIR}")
-print(f"🌐 Playit 경로: {PLAYIT_DIR}")
+# [디버깅용] 봇이 켜질 때 실제 경로를 콘솔에 출력해서 확인하게 합니다.
+print(f"📂 [경로 확인] 마크 루트: {MC_ROOT_DIR}")
+print(f"📂 [경로 확인] Playit 폴더: {PLAYIT_DIR}")
 
 FFMPEG_FILTERS = {
     'normal': '',
@@ -376,18 +376,24 @@ async def server_list_autocomplete(
     interaction: discord.Interaction,
     current: str,
 ) -> list[app_commands.Choice[str]]:
+    # 1. 경로가 실제로 존재하는지 먼저 검사
     if not os.path.exists(MC_ROOT_DIR):
-        print(f"⚠️ 경로를 찾을 수 없음: {MC_ROOT_DIR}")
+        return [app_commands.Choice(name="⚠️ 경로 오류 (server/mc 폴더 없음)", value="error")]
+    
+    try:
+        # 2. 폴더 목록 가져오기
+        folders = [f for f in os.listdir(MC_ROOT_DIR) if os.path.isdir(os.path.join(MC_ROOT_DIR, f))]
+        
+        # 3. 검색어 필터링
+        choices = [
+            app_commands.Choice(name=folder, value=folder)
+            for folder in folders if current.lower() in folder.lower()
+        ]
+        
+        return choices[:25] # 디스코드 최대 25개 제한
+    except Exception as e:
+        print(f"❌ 자동 완성 오류: {e}")
         return []
-    
-    # mc 폴더 안의 항목 중 '폴더'인 것만 골라냅니다.
-    folders = [f for f in os.listdir(MC_ROOT_DIR) if os.path.isdir(os.path.join(MC_ROOT_DIR, f))]
-    
-    # 유저가 입력 중인 글자가 포함된 것만 25개까지 필터링해서 보여줍니다.
-    return [
-        app_commands.Choice(name=folder, value=folder)
-        for folder in folders if current.lower() in folder.lower()
-    ][:25]
 
 @bot.tree.command(name="서버켜기", description="[관리자] mc 폴더 내의 서버를 선택하여 실행합니다.")
 @app_commands.autocomplete(server_name=server_list_autocomplete)

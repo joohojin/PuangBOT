@@ -17,13 +17,36 @@ import json
 import math
 from discord.ext import tasks
 from mcrcon import MCRcon
-# --- [수정: TTS 라이브러리 추가] ---
+# --- [수정: 개인별 맞춤 TTS 및 자동 설치 설정] ---
+import subprocess
+import sys
+
+# edge-tts 자동 설치 로직
+try:
+    import edge_tts
+except ImportError:
+    print("🔄 edge-tts가 없습니다. 자동으로 설치합니다...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "edge-tts"])
+    import edge_tts
+    print("✅ edge-tts 설치 완료!")
+
 from gtts import gTTS
 import uuid
 import os
+import json
 
-# TTS 기능을 켠 유저들을 추적하는 명부
-tts_users = set()
+TTS_FILE = "tts_settings.json"
+
+def load_tts():
+    try:
+        with open(TTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def save_tts(data):
+    with open(TTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
 # -----------------------------------
 
 # ==========================================
@@ -180,45 +203,47 @@ async def add_xp(user: discord.Member, amount: int, channel: discord.TextChannel
     else:
         save_xp(data)
 
-# --- [수정: TTS 처리 백그라운드 엔진] ---
+# --- [수정: TTS 처리 백그라운드 엔진 (gTTS & Edge-TTS 하이브리드)] ---
 async def process_tts_queue(guild: discord.Guild):
     state = get_state(guild.id)
     vc = guild.voice_client
     
     while not state.tts_queue.empty():
-        text = await state.tts_queue.get()
+        payload = await state.tts_queue.get()
         
         if not vc or not vc.is_connected():
             break
 
         try:
-            # 1. 텍스트를 mp3 파일로 변환 (고유 이름 부여)
-            tts = gTTS(text=text, lang='ko')
             filename = f"tts_{uuid.uuid4().hex}.mp3"
-            tts.save(filename)
             
-            # 2. 음악 재생 중첩 문제 해결 (음악 임시 정지)
+            # 1. 유저 설정에 따라 엔진 분기 처리
+            if payload.get("engine") == "edge":
+                communicate = edge_tts.Communicate(payload["text"], payload["voice"], pitch=payload["pitch"])
+                await communicate.save(filename)
+            else:
+                # 기본 엔진 (gTTS)
+                tts = gTTS(text=payload["text"], lang='ko')
+                tts.save(filename)
+            
+            # 2. 음악 재생 중첩 방지
             was_playing_music = False
             if vc.is_playing():
                 was_playing_music = True
-                vc.pause() # 음악 멈춰!
+                vc.pause()
             
-            # 3. 재생 완료 후 파일을 지우는 정리 함수
             def cleanup(error):
                 try: os.remove(filename)
                 except: pass
 
-            # 4. TTS 재생
+            # 3. 재생
             tts_source = discord.FFmpegPCMAudio(filename, executable=FFMPEG_PATH)
-            # 볼륨을 약간 키워줍니다
-            tts_source = discord.PCMVolumeTransformer(tts_source, volume=1.0) 
+            tts_source = discord.PCMVolumeTransformer(tts_source, volume=1.2) 
             vc.play(tts_source, after=cleanup)
             
-            # 5. TTS가 끝날 때까지 대기
             while vc.is_playing():
                 await asyncio.sleep(0.5)
                 
-            # 6. 아까 음악이 재생 중이었다면 다시 재생 (Resume)
             if was_playing_music:
                 vc.resume()
 
@@ -226,7 +251,6 @@ async def process_tts_queue(guild: discord.Guild):
             print(f"TTS 에러: {e}")
             try: os.remove(filename)
             except: pass
-    # --- [추가: 큐의 모든 텍스트를 다 읽고 나면 기억 리셋] ---
 # -----------------------------------
 
 def get_state(guild_id):
@@ -412,8 +436,12 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot: return
 
-    # --- [수정: TTS 감지 및 닉네임 연속 생략 로직] ---
-    if message.author.id in tts_users and message.author.voice:
+    # --- [수정: 개인별 TTS 감지 및 옵션 적용 로직] ---
+    tts_data = load_tts()
+    uid = str(message.author.id)
+    user_settings = tts_data.get(uid, {})
+    
+    if user_settings.get("enabled", False) and message.author.voice:
         guild_id = message.guild.id
         state = get_state(guild_id)
         
@@ -421,14 +449,26 @@ async def on_message(message: discord.Message):
             await message.author.voice.channel.connect(timeout=20.0, self_deaf=True)
             state.voice_client = message.guild.voice_client
             
-        # 연속 말하기 체크: 마지막으로 말한 사람과 같으면 닉네임 생략!
-        if state.last_tts_user == message.author.id:
-            text_to_read = message.content
+        say_name = user_settings.get("say_name", "yes")
+        
+        if say_name == "yes":
+            if state.last_tts_user == message.author.id:
+                text_to_read = message.content 
+            else:
+                text_to_read = f"{message.author.display_name}님의 말. {message.content}"
         else:
-            text_to_read = f"{message.author.display_name}님의 말. {message.content}"
-            state.last_tts_user = message.author.id  # 마지막 화자 업데이트
+            text_to_read = message.content
             
-        await state.tts_queue.put(text_to_read)
+        state.last_tts_user = message.author.id 
+        
+        # 엔진과 부가 설정을 큐에 담아서 전송 (엔진 기본값은 gtts)
+        payload = {
+            "text": text_to_read,
+            "engine": user_settings.get("engine", "gtts"),
+            "voice": user_settings.get("voice", "ko-KR-SunHiNeural"),
+            "pitch": user_settings.get("pitch", "+0Hz")
+        }
+        await state.tts_queue.put(payload)
         
         if state.tts_task is None or state.tts_task.done():
             state.tts_task = asyncio.create_task(process_tts_queue(message.guild))
@@ -580,20 +620,49 @@ async def close_tunnel(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ 프로세스 종료 실패: {e}")
 
-# --- [수정: TTS 제어 명령어 추가] ---
-@bot.tree.command(name="tts켜기", description="[전체 유저] 채팅을 치면 푸앙이가 음성 채널에서 대신 읽어줍니다.")
-async def tts_on(interaction: discord.Interaction):
-    if not interaction.user.voice:
-        await interaction.response.send_message("❌ 음성 채널에 먼저 접속한 상태에서 사용해주세요!", ephemeral=True)
-        return
-        
-    tts_users.add(interaction.user.id)
-    await interaction.response.send_message("🎙️ **TTS 모드 ON!**\n지금부터 이 채널에 채팅을 치면 푸앙이가 목소리로 읽어줄게요!", ephemeral=True)
-
-@bot.tree.command(name="tts끄기", description="[전체 유저] TTS 기능을 끕니다.")
-async def tts_off(interaction: discord.Interaction):
-    tts_users.discard(interaction.user.id)
-    await interaction.response.send_message("🔇 **TTS 모드 OFF!**", ephemeral=True)
+# --- [수정: 개인별 맞춤 TTS 설정 명령어] ---
+@bot.tree.command(name="tts설정", description="나만의 TTS 엔진, 목소리, 피치, 이름 부르기 여부를 설정합니다.")
+@app_commands.describe(
+    상태="TTS 기능을 켤지 끌지 선택하세요",
+    엔진="사용할 TTS 엔진을 선택하세요 (기본: gTTS)",
+    목소리="[Edge전용] 원하는 목소리 성별을 선택하세요",
+    피치="[Edge전용] 목소리의 높낮이를 조절하세요",
+    이름부르기="내 채팅을 읽을 때 닉네임을 먼저 부를지 선택하세요"
+)
+@app_commands.choices(
+    상태=[app_commands.Choice(name="🟢 켜기", value="on"), 
+         app_commands.Choice(name="🔴 끄기", value="off")],
+    엔진=[app_commands.Choice(name="🤖 기본 (gTTS)", value="gtts"),
+         app_commands.Choice(name="✨ 고품질 (Edge-TTS)", value="edge")],
+    목소리=[app_commands.Choice(name="👩 여성 (SunHi)", value="ko-KR-SunHiNeural"),
+         app_commands.Choice(name="👨 남성 (InJoon)", value="ko-KR-InJoonNeural")],
+    피치=[app_commands.Choice(name="기본 톤", value="+0Hz"),
+        app_commands.Choice(name="약간 높게", value="+15Hz"),
+        app_commands.Choice(name="약간 낮게", value="-15Hz"),
+        app_commands.Choice(name="🎈 헬륨 가스", value="+40Hz"),
+        app_commands.Choice(name="🐻 동굴 소리", value="-40Hz")],
+    이름부르기=[app_commands.Choice(name="O (이름 먼저 부르기)", value="yes"),
+            app_commands.Choice(name="X (내용만 바로 읽기)", value="no")]
+)
+async def tts_setup(interaction: discord.Interaction, 상태: str, 엔진: str = "gtts", 목소리: str = "ko-KR-SunHiNeural", 피치: str = "+0Hz", 이름부르기: str = "yes"):
+    data = load_tts()
+    uid = str(interaction.user.id)
+    
+    # 선택한 옵션 저장
+    data[uid] = {
+        "enabled": True if 상태 == "on" else False,
+        "engine": 엔진,
+        "voice": 목소리,
+        "pitch": 피치,
+        "say_name": 이름부르기
+    }
+    save_tts(data)
+    
+    if 상태 == "on":
+        engine_name = "기본 gTTS" if 엔진 == "gtts" else "고품질 Edge-TTS"
+        await interaction.response.send_message(f"🎙️ **TTS 설정 완료!**\n- 엔진: {engine_name}\n- 목소리: {'여성' if 'SunHi' in 목소리 else '남성'} (Edge 전용)\n- 톤: {피치} (Edge 전용)\n- 닉네임 호출: {'사용함' if 이름부르기 == 'yes' else '사용 안 함'}", ephemeral=True)
+    else:
+        await interaction.response.send_message("🔇 **TTS 기능을 껐습니다.** (설정값은 안전하게 저장되었습니다)", ephemeral=True)
 # -----------------------------------
 
 @bot.tree.command(name="업데이트", description="[개발자 전용] 깃허브에서 코드를 받아오고 봇을 재시작합니다.")

@@ -227,7 +227,6 @@ async def process_tts_queue(guild: discord.Guild):
             try: os.remove(filename)
             except: pass
     # --- [추가: 큐의 모든 텍스트를 다 읽고 나면 기억 리셋] ---
-    state.last_tts_user = None
 # -----------------------------------
 
 def get_state(guild_id):

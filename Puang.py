@@ -125,6 +125,8 @@ class GuildState:
         # --- [수정: TTS 큐 시스템 추가] ---
         self.tts_queue = asyncio.Queue()
         self.tts_task = None
+        # --- [추가: 마지막으로 TTS를 사용한 유저 기억] ---
+        self.last_tts_user = None
         # -----------------------------------
 
 guild_states = {}
@@ -224,6 +226,8 @@ async def process_tts_queue(guild: discord.Guild):
             print(f"TTS 에러: {e}")
             try: os.remove(filename)
             except: pass
+    # --- [추가: 큐의 모든 텍스트를 다 읽고 나면 기억 리셋] ---
+    state.last_tts_user = None
 # -----------------------------------
 
 def get_state(guild_id):
@@ -409,21 +413,24 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot: return
 
-    # --- [수정: TTS 감지 로직 추가] ---
+    # --- [수정: TTS 감지 및 닉네임 연속 생략 로직] ---
     if message.author.id in tts_users and message.author.voice:
         guild_id = message.guild.id
         state = get_state(guild_id)
         
-        # 봇이 음성 채널에 없으면 유저가 있는 곳으로 먼저 들어감
         if not message.guild.voice_client:
             await message.author.voice.channel.connect(timeout=20.0, self_deaf=True)
             state.voice_client = message.guild.voice_client
             
-        # "닉네임님이 말합니다"를 붙여서 큐에 삽입
-        text_to_read = f"{message.author.display_name}님의 말. {message.content}"
+        # 연속 말하기 체크: 마지막으로 말한 사람과 같으면 닉네임 생략!
+        if state.last_tts_user == message.author.id:
+            text_to_read = message.content
+        else:
+            text_to_read = f"{message.author.display_name}님의 말. {message.content}"
+            state.last_tts_user = message.author.id  # 마지막 화자 업데이트
+            
         await state.tts_queue.put(text_to_read)
         
-        # 엔진이 안 돌아가고 있다면 시동 걸기
         if state.tts_task is None or state.tts_task.done():
             state.tts_task = asyncio.create_task(process_tts_queue(message.guild))
     # -----------------------------------
@@ -707,6 +714,35 @@ async def play(interaction: discord.Interaction, search: str):
     except Exception as e:
         print(f"재생 에러: {e}")
         await interaction.followup.send("❌ 노래를 찾을 수 없거나 오류가 발생했어요.")
+
+# --- [추가: 고급 대기열 관리 명령어] ---
+@bot.tree.command(name="대기열삭제", description="대기열에서 특정 번호의 노래를 삭제합니다.")
+@app_commands.describe(index="삭제할 노래의 번호 (대기열 명렁어로 확인)")
+async def remove_from_queue(interaction: discord.Interaction, index: int):
+    state = get_state(interaction.guild_id)
+    
+    if not state.queue:
+        await interaction.response.send_message("❌ 대기열이 비어있습니다.", ephemeral=True)
+        return
+        
+    if index < 1 or index > len(state.queue):
+        await interaction.response.send_message(f"❌ 올바른 번호를 입력해주세요. (1 ~ {len(state.queue)} 사이)", ephemeral=True)
+        return
+        
+    removed_song = state.queue.pop(index - 1)
+    await interaction.response.send_message(f"🗑️ 대기열에서 **{removed_song.title}** 노래를 쏙 뺐습니다!")
+
+@bot.tree.command(name="대기열섞기", description="현재 대기열의 노래 순서를 무작위로 셔플합니다.")
+async def shuffle_queue(interaction: discord.Interaction):
+    state = get_state(interaction.guild_id)
+    
+    if len(state.queue) < 2:
+        await interaction.response.send_message("❌ 섞을 노래가 2곡 이상 필요합니다.", ephemeral=True)
+        return
+        
+    random.shuffle(state.queue)
+    await interaction.response.send_message("🔀 **대기열을 무작위로 섞었습니다!** `/대기열` 명령어로 바뀐 순서를 확인해보세요.")
+# -----------------------------------
 
 @bot.tree.command(name="미니푸앙", description="푸앙봇의 시그니처 텍스트 아트를 출력합니다.")
 async def print_ascii_mini(interaction: discord.Interaction):

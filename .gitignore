@@ -5,6 +5,14 @@ __pycache__/
 # 봇 보안 토큰 및 경험치 (절대 올라가면 안됨)
 token.txt
 puang_xp.json
+tts_settings.json
+volume_settings.json
+ai_settings.json
+ai_providers.json
+ai_models.json
+ai_usage_log.jsonl
+ai_short_memory.json
+ai_long_memory.json
 
 # FFmpeg 및 자동 다운로드 임시 파일들
 ffmpeg.exe

@@ -15,6 +15,22 @@
       "fallbacks": ["local-tiny"],
       "note": "저사양 PC 기본 대화 모델"
     },
+    "local-gemma4": {
+      "label": "Gemma 4 8B",
+      "provider": "local-ollama",
+      "model": "gemma4:latest",
+      "capabilities": ["text", "image"],
+      "privacy": "local",
+      "selectable": true,
+      "visible": true,
+      "group": "local",
+      "cost_tier": "free",
+      "context": 8192,
+      "timeout": 300,
+      "max_tokens": 4096,
+      "fallbacks": ["local-fast", "local-tiny"],
+      "note": "16GB RAM 환경의 고품질 로컬 기본 모델 후보"
+    },
     "local-tiny": {
       "label": "로컬 최후 백업",
       "provider": "local-ollama",

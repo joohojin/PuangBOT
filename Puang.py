@@ -58,12 +58,24 @@ AI_DEFAULT_FALLBACK_VISION_MODEL = "local-vision"
 AI_DEFAULT_DOCUMENT_MODEL = "local-fast"
 AI_DEFAULT_FALLBACK_POLICY = "safe_degrade"
 AI_DEFAULT_BASE_URL = "http://127.0.0.1:11434"
+AI_DEFAULT_MAX_TOKENS = 2048
+AI_LONGFORM_MAX_TOKENS = 4096
 AI_SHORT_MEMORY_LIMIT = 20
 AI_LONG_MEMORY_LIMIT = 500
 AI_MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
+DISCORD_MESSAGE_CONTENT_LIMIT = 2000
+DISCORD_SAFE_MESSAGE_LIMIT = 1900
+AI_REPLY_INLINE_LIMIT = DISCORD_SAFE_MESSAGE_LIMIT
+AI_REPLY_PREVIEW_LIMIT = 1000
+AI_REPLY_FILE_BYTE_LIMIT = 8 * 1024 * 1024
 AI_ALLOWED_TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".yml", ".yaml"}
 AI_ALLOWED_DOCUMENT_EXTENSIONS = {".pdf", ".docx"}
 AI_ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+AI_SYSTEM_PROMPT = (
+    "너는 디스코드 서버의 로컬 AI 비서 '푸앙봇'이다. "
+    "한국어로 자연스럽고 간결하게 답하되, 사용자가 요구하면 자세히 설명한다. "
+    "최근 대화 기억을 참고하고, 첨부 문서나 이미지 정보가 있으면 그 내용을 근거로 답한다."
+)
 
 def load_tts():
     try:
@@ -198,6 +210,22 @@ def get_default_ai_models():
                 "fallbacks": ["local-tiny"],
                 "note": "저사양 PC 기본 대화 모델"
             },
+            "local-gemma4": {
+                "label": "Gemma 4 8B",
+                "provider": "local-ollama",
+                "model": "gemma4:latest",
+                "capabilities": ["text", "image"],
+                "privacy": "local",
+                "selectable": True,
+                "visible": True,
+                "group": "local",
+                "cost_tier": "free",
+                "context": 8192,
+                "timeout": 300,
+                "max_tokens": AI_LONGFORM_MAX_TOKENS,
+                "fallbacks": ["local-fast", "local-tiny"],
+                "note": "16GB RAM 환경의 고품질 로컬 기본 모델 후보"
+            },
             "local-korean": {
                 "label": "로컬 한국어 품질",
                 "provider": "local-ollama",
@@ -317,6 +345,8 @@ LEGACY_AI_PROFILE_ALIASES = {
     "exaone3.5:2.4b": "local-korean",
     "exaone3.5:7.8b": "local-korean-large",
     "moondream": "local-vision",
+    "gemma4": "local-gemma4",
+    "gemma4:latest": "local-gemma4",
     "gemma3:4b": "local-gemma3-vision",
     "llava:7b": "local-llava"
 }
@@ -436,7 +466,9 @@ def build_default_ai_channel_config(guild=None):
         "route_policy": guild.get("route_policy", "selected_first"),
         "fallback_policy": guild.get("fallback_policy", AI_DEFAULT_FALLBACK_POLICY),
         "temperature": guild.get("temperature", 0.7),
-        "max_tokens": guild.get("max_tokens", 800)
+        "max_tokens": guild.get("max_tokens", AI_DEFAULT_MAX_TOKENS),
+        "reply_mode": guild.get("reply_mode", "auto"),
+        "reply_inline_limit": clamp_discord_inline_limit(guild.get("reply_inline_limit", AI_REPLY_INLINE_LIMIT))
     }
 
 def normalize_ai_channel_config(config):
@@ -462,7 +494,12 @@ def normalize_ai_channel_config(config):
     config.setdefault("route_policy", "selected_first")
     config.setdefault("fallback_policy", AI_DEFAULT_FALLBACK_POLICY)
     config.setdefault("temperature", 0.7)
-    config.setdefault("max_tokens", 800)
+    config.setdefault("max_tokens", AI_DEFAULT_MAX_TOKENS)
+    if config.get("reply_mode") not in ("auto", "file", "split"):
+        config["reply_mode"] = "auto"
+    else:
+        config.setdefault("reply_mode", "auto")
+    config["reply_inline_limit"] = clamp_discord_inline_limit(config.get("reply_inline_limit", AI_REPLY_INLINE_LIMIT))
     return config
 
 def get_ai_channel_config(guild_id, channel_id, create=False):
@@ -590,6 +627,13 @@ def truncate_for_prompt(text, limit=6000):
     text = text or ""
     return text if len(text) <= limit else text[:limit] + "\n...[내용이 길어 일부만 사용됨]"
 
+def clamp_discord_inline_limit(value, default=AI_REPLY_INLINE_LIMIT):
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = int(default)
+    return max(500, min(DISCORD_SAFE_MESSAGE_LIMIT, limit))
+
 def extract_docx_text(data):
     with zipfile.ZipFile(io.BytesIO(data)) as docx:
         xml_data = docx.read("word/document.xml")
@@ -716,6 +760,17 @@ def get_ai_request_timeout(profile, config):
     provider = get_ai_provider_for_profile(profile)
     return int(profile.get("timeout") or provider.get("timeout") or config.get("timeout") or 180)
 
+def get_ai_max_tokens(profile, config):
+    profile_tokens = int(profile.get("max_tokens") or 0)
+    config_tokens = int(config.get("max_tokens") or 0)
+    if config_tokens and config_tokens not in (800, AI_DEFAULT_MAX_TOKENS):
+        return config_tokens
+    if profile_tokens:
+        return profile_tokens
+    if config_tokens:
+        return max(config_tokens, AI_DEFAULT_MAX_TOKENS)
+    return AI_DEFAULT_MAX_TOKENS
+
 def get_provider_headers(provider):
     headers = {}
     api_key_env = provider.get("api_key_env")
@@ -779,7 +834,7 @@ async def call_openai_compatible_chat(config, provider, profile, message, prompt
         "model": profile.get("model", profile["name"]),
         "messages": messages,
         "temperature": float(config.get("temperature", 0.7)),
-        "max_tokens": int(config.get("max_tokens", 800)),
+        "max_tokens": get_ai_max_tokens(profile, config),
         "stream": False
     }
     timeout = aiohttp.ClientTimeout(total=get_ai_request_timeout(profile, config))
@@ -801,7 +856,7 @@ async def call_ollama_native_chat(config, provider, profile, message, prompt_tex
 
     options = {
         "temperature": float(config.get("temperature", 0.7)),
-        "num_predict": int(config.get("max_tokens", 800))
+        "num_predict": get_ai_max_tokens(profile, config)
     }
     if profile.get("context"):
         options["num_ctx"] = int(profile["context"])
@@ -847,11 +902,7 @@ def build_ai_messages(message, prompt_text, image_payloads=None, current_memory_
         history = history[:-1]
     messages = [{
         "role": "system",
-        "content": (
-            "너는 디스코드 서버의 로컬 AI 비서 '푸앙봇'이다. "
-            "한국어로 자연스럽고 간결하게 답하되, 사용자가 요구하면 자세히 설명한다. "
-            "최근 대화 기억을 참고하고, 첨부 문서나 이미지 정보가 있으면 그 내용을 근거로 답한다."
-        )
+        "content": AI_SYSTEM_PROMPT
     }]
 
     for item in history[-AI_SHORT_MEMORY_LIMIT:]:
@@ -868,7 +919,7 @@ def build_ai_messages(message, prompt_text, image_payloads=None, current_memory_
         messages.append({"role": "user", "content": prompt_text})
     return messages
 
-def split_discord_message(text, limit=1900):
+def split_discord_message(text, limit=DISCORD_SAFE_MESSAGE_LIMIT):
     chunks = []
     while len(text) > limit:
         cut = text.rfind("\n", 0, limit)
@@ -879,6 +930,89 @@ def split_discord_message(text, limit=1900):
     if text:
         chunks.append(text)
     return chunks
+
+def split_text_by_utf8_bytes(text, byte_limit):
+    chunks = []
+    current = []
+    current_size = 0
+    for char in text:
+        char_size = len(char.encode("utf-8"))
+        if current and current_size + char_size > byte_limit:
+            chunks.append("".join(current))
+            current = [char]
+            current_size = char_size
+        else:
+            current.append(char)
+            current_size += char_size
+    if current:
+        chunks.append("".join(current))
+    return chunks or [""]
+
+def build_ai_answer_file_text(message, answer, route=None):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    guild_name = message.guild.name if message.guild else "DM"
+    channel_name = getattr(message.channel, "name", str(message.channel))
+    author_name = getattr(message.author, "display_name", str(message.author))
+    metadata = [
+        "PuangBOT AI Response",
+        f"Time: {now}",
+        f"Guild: {guild_name}",
+        f"Channel: {channel_name}",
+        f"User: {author_name}"
+    ]
+    if route:
+        metadata.append(f"Route: {route}")
+    return "\n".join(metadata) + "\n\n--- Answer ---\n\n" + (answer or "")
+
+def build_ai_answer_filename(index=0, total=1):
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = f"_part{index + 1:02d}" if total > 1 else ""
+    return f"puangbot_ai_{timestamp}{suffix}.txt"
+
+async def send_ai_answer(message, answer, route=None, config=None):
+    answer = (answer or "").strip() or "(빈 응답)"
+    config = config or {}
+    reply_mode = config.get("reply_mode", "auto")
+    if reply_mode not in ("auto", "file", "split"):
+        reply_mode = "auto"
+    inline_limit = clamp_discord_inline_limit(config.get("reply_inline_limit", AI_REPLY_INLINE_LIMIT))
+
+    if reply_mode == "split":
+        for index, chunk in enumerate(split_discord_message(answer)):
+            if index == 0:
+                await message.reply(chunk, mention_author=False)
+            else:
+                await message.channel.send(chunk)
+        return
+
+    if reply_mode == "auto" and len(answer) <= inline_limit:
+        await message.reply(answer, mention_author=False)
+        return
+
+    intro_prefix = "답변이 길어서 전체 내용은 텍스트 파일로 첨부했어요.\n\n미리보기:\n"
+    preview_limit = min(AI_REPLY_PREVIEW_LIMIT, max(100, DISCORD_SAFE_MESSAGE_LIMIT - len(intro_prefix) - 40))
+    preview = truncate_for_prompt(answer, preview_limit)
+    file_text = build_ai_answer_file_text(message, answer, route)
+    file_chunks = split_text_by_utf8_bytes(file_text, AI_REPLY_FILE_BYTE_LIMIT)
+    total = len(file_chunks)
+    intro = intro_prefix + preview
+    if len(intro) > DISCORD_SAFE_MESSAGE_LIMIT:
+        intro = intro[:DISCORD_SAFE_MESSAGE_LIMIT - 20].rstrip() + "\n..."
+
+    try:
+        for index, chunk in enumerate(file_chunks):
+            file_data = io.BytesIO(chunk.encode("utf-8"))
+            file = discord.File(file_data, filename=build_ai_answer_filename(index, total))
+            if index == 0:
+                await message.reply(intro, file=file, mention_author=False)
+            else:
+                await message.channel.send(f"긴 답변 이어서 첨부합니다. ({index + 1}/{total})", file=file)
+    except Exception:
+        for index, chunk in enumerate(split_discord_message(answer)):
+            if index == 0:
+                await message.reply(chunk, mention_author=False)
+            else:
+                await message.channel.send(chunk)
 
 def clamp_percent(value, minimum=0, maximum=200):
     return max(minimum, min(maximum, int(value)))
@@ -2370,6 +2504,11 @@ def build_ai_panel_embed(guild_id, channel):
     embed.add_field(name="이미지 프로필", value=format_ai_profile_summary(config.get("vision_profile")), inline=False)
     embed.add_field(name="문서 프로필", value=format_ai_profile_summary(config.get("document_profile")), inline=False)
     embed.add_field(name="백업 프로필", value=format_ai_profile_list(config.get("fallback_profiles")), inline=False)
+    embed.add_field(
+        name="응답 전송",
+        value=f"`{config.get('reply_mode', 'auto')}` · {config.get('reply_inline_limit', AI_REPLY_INLINE_LIMIT)}자 초과 파일 · {get_ai_max_tokens(profile, config)} 토큰",
+        inline=False
+    )
     embed.add_field(name="기억", value=f"단기 {short_count}개 · 장기 {long_count}개", inline=False)
     return embed
 
@@ -2632,9 +2771,54 @@ async def ai_status(interaction: discord.Interaction, 채널: discord.TextChanne
     embed.add_field(name="백업 프로필", value=format_ai_profile_list(config.get("fallback_profiles")), inline=False)
     embed.add_field(name="백업 정책", value=f"`{config.get('fallback_policy', AI_DEFAULT_FALLBACK_POLICY)}`", inline=True)
     embed.add_field(name="Provider", value=get_ai_provider_display(profile), inline=False)
+    embed.add_field(name="응답 전송", value=f"`{config.get('reply_mode', 'auto')}` / {config.get('reply_inline_limit', AI_REPLY_INLINE_LIMIT)}자 초과 파일", inline=True)
+    embed.add_field(name="생성 제한", value=f"{get_ai_max_tokens(profile, config)} 토큰", inline=True)
     embed.add_field(name="단기 기억", value=f"{short_count}개", inline=True)
     embed.add_field(name="장기 기억", value=f"{long_count}개", inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="ai응답설정", description="AI 긴 답변 전송 방식과 생성 길이 제한을 설정합니다.")
+@app_commands.describe(
+    채널="설정을 바꿀 채널입니다. 비워두면 현재 채널에 적용됩니다.",
+    방식="긴 답변을 처리하는 방식입니다.",
+    긴답변기준="자동 모드에서 이 글자 수를 넘으면 파일로 첨부합니다. 최대: 1900",
+    최대생성토큰="모델이 생성할 최대 토큰 수입니다. Gemma4 권장: 4096"
+)
+@app_commands.choices(
+    방식=[
+        app_commands.Choice(name="자동: 짧으면 메시지, 길면 파일", value="auto"),
+        app_commands.Choice(name="항상 파일 첨부", value="file"),
+        app_commands.Choice(name="메시지 분할", value="split")
+    ]
+)
+async def ai_response_settings(
+    interaction: discord.Interaction,
+    채널: discord.TextChannel = None,
+    방식: str = "auto",
+    긴답변기준: int = AI_REPLY_INLINE_LIMIT,
+    최대생성토큰: int = AI_DEFAULT_MAX_TOKENS
+):
+    if not can_manage_ai_settings(interaction.user):
+        await interaction.response.send_message("❌ 서버 관리 권한 또는 오너 권한이 필요합니다.", ephemeral=True)
+        return
+
+    inline_limit = clamp_discord_inline_limit(긴답변기준)
+    max_tokens = max(256, min(8192, int(최대생성토큰)))
+    target_channel = 채널 or interaction.channel
+    config = set_ai_channel_config(
+        interaction.guild_id,
+        target_channel.id,
+        reply_mode=방식,
+        reply_inline_limit=inline_limit,
+        max_tokens=max_tokens
+    )
+    await interaction.response.send_message(
+        f"✅ {target_channel.mention} AI 응답 설정을 저장했습니다.\n"
+        f"- 전송 방식: `{config['reply_mode']}`\n"
+        f"- 긴 답변 기준: `{config['reply_inline_limit']}`자\n"
+        f"- 최대 생성 토큰: `{config['max_tokens']}`",
+        ephemeral=True
+    )
 
 @bot.tree.command(name="ai모델목록", description="등록된 로컬 LLM 모델 프로필과 기능을 확인합니다.")
 async def ai_model_list(interaction: discord.Interaction):

@@ -1,0 +1,21 @@
+{
+  "channel_history": {
+    "enabled": true,
+    "auto_reference": false,
+    "db_path": "ai_history.sqlite3",
+    "default_recent_limit": 50,
+    "default_search_limit": 8,
+    "max_context_chars": 12000,
+    "index_bots": false
+  },
+  "web_search": {
+    "enabled": false,
+    "auto_search": false,
+    "search_on_uncertain": true,
+    "provider": "searxng",
+    "base_url": "http://127.0.0.1:8080",
+    "max_results": 5,
+    "timeout": 15,
+    "fetch_pages": false
+  }
+}

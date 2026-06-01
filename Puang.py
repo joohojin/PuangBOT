@@ -11,6 +11,7 @@ import sys
 import subprocess
 import platform
 import urllib.request
+import urllib.parse
 import zipfile
 import shutil
 import json
@@ -18,6 +19,8 @@ import math
 import base64
 import io
 import re
+import sqlite3
+import types
 import xml.etree.ElementTree as ET
 from array import array
 from queue import Empty, Queue
@@ -47,9 +50,11 @@ VOLUME_FILE = "volume_settings.json"
 AI_SETTINGS_FILE = "ai_settings.json"
 AI_PROVIDERS_FILE = "ai_providers.json"
 AI_MODELS_FILE = "ai_models.json"
+AI_TOOLS_FILE = "ai_tools.json"
 AI_USAGE_LOG_FILE = "ai_usage_log.jsonl"
 AI_SHORT_MEMORY_FILE = "ai_short_memory.json"
 AI_LONG_MEMORY_FILE = "ai_long_memory.json"
+AI_HISTORY_DB_FILE = "ai_history.sqlite3"
 
 AI_DEFAULT_PROVIDER_ID = "local-ollama"
 AI_DEFAULT_MODEL = "local-fast"
@@ -68,6 +73,14 @@ DISCORD_SAFE_MESSAGE_LIMIT = 1900
 AI_REPLY_INLINE_LIMIT = DISCORD_SAFE_MESSAGE_LIMIT
 AI_REPLY_PREVIEW_LIMIT = 1000
 AI_REPLY_FILE_BYTE_LIMIT = 8 * 1024 * 1024
+AI_HISTORY_DEFAULT_SEARCH_LIMIT = 8
+AI_HISTORY_MAX_CONTEXT_CHARS = 12000
+AI_HISTORY_INDEX_BATCH_SIZE = 100
+AI_WEB_SEARCH_MAX_RESULTS = 5
+AI_TOOL_DIRECTIVE_PREFIXES = {
+    "web": ("/검색", "검색", "웹검색", "인터넷검색"),
+    "history": ("/기록검색", "기록검색", "대화검색", "채팅검색")
+}
 AI_ALLOWED_TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".yml", ".yaml"}
 AI_ALLOWED_DOCUMENT_EXTENSIONS = {".pdf", ".docx"}
 AI_ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -75,6 +88,9 @@ AI_SYSTEM_PROMPT = (
     "너는 디스코드 서버의 로컬 AI 비서 '푸앙봇'이다. "
     "한국어로 자연스럽고 간결하게 답하되, 사용자가 요구하면 자세히 설명한다. "
     "최근 대화 기억을 참고하고, 첨부 문서나 이미지 정보가 있으면 그 내용을 근거로 답한다."
+    "종결 어미로는 '~푸앙' 또는 '~푸앙푸앙'등과 함께 이모지를 자주 사용한다. "
+    "답변에 정확한 정보가 필요하면 웹 검색 도구를 활용해서 찾아보고, 대화 기록 검색 도구로 최근 대화 내용을 참고한다. "
+    " '잘 모르겠다', '확인할 수 없다', '최신 정보가 필요하다' 등의 표현으로 솔직하게 답하되, 가능한 한 도움을 주려고 노력한다. "
 )
 
 def load_tts():
@@ -122,6 +138,45 @@ def load_json_file(path, default=None):
 def save_json_file(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+def get_default_ai_tools():
+    return {
+        "channel_history": {
+            "enabled": True,
+            "auto_reference": False,
+            "db_path": AI_HISTORY_DB_FILE,
+            "default_recent_limit": 50,
+            "default_search_limit": AI_HISTORY_DEFAULT_SEARCH_LIMIT,
+            "max_context_chars": AI_HISTORY_MAX_CONTEXT_CHARS,
+            "index_bots": False
+        },
+        "web_search": {
+            "enabled": False,
+            "auto_search": False,
+            "search_on_uncertain": True,
+            "provider": "searxng",
+            "base_url": "http://127.0.0.1:8080",
+            "max_results": AI_WEB_SEARCH_MAX_RESULTS,
+            "timeout": 15,
+            "fetch_pages": False
+        }
+    }
+
+def get_ai_tools():
+    defaults = get_default_ai_tools()
+    data = load_json_file(AI_TOOLS_FILE, None)
+    if not isinstance(data, dict):
+        return defaults
+
+    merged = {}
+    for key, value in defaults.items():
+        merged[key] = value.copy()
+        if isinstance(data.get(key), dict):
+            merged[key].update(data[key])
+    return merged
+
+def save_ai_tools(data):
+    save_json_file(AI_TOOLS_FILE, data)
 
 def get_default_ai_providers():
     return {
@@ -589,6 +644,466 @@ def count_ai_memory(file_path, guild_id, channel_id):
     memory = load_json_file(file_path, {})
     return len(memory.get(str(guild_id), {}).get(str(channel_id), []))
 
+def parse_user_datetime(value):
+    value = (value or "").strip()
+    if not value:
+        return None
+    normalized = value.replace("/", "-")
+    formats = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d")
+    parsed = None
+    for fmt in formats:
+        try:
+            parsed = datetime.datetime.strptime(normalized, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        try:
+            parsed = datetime.datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
+    return parsed.astimezone(datetime.timezone.utc)
+
+def get_ai_history_db_path():
+    tools = get_ai_tools()
+    return tools.get("channel_history", {}).get("db_path") or AI_HISTORY_DB_FILE
+
+def get_ai_history_connection():
+    conn = sqlite3.connect(get_ai_history_db_path())
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_ai_history_db():
+    with get_ai_history_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                message_id TEXT PRIMARY KEY,
+                author_id TEXT,
+                author_name TEXT,
+                created_at TEXT,
+                edited_at TEXT,
+                content TEXT,
+                clean_content TEXT,
+                attachment_summary TEXT,
+                reply_to_id TEXT,
+                jump_url TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_history_channel_time ON messages(guild_id, channel_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_history_author ON messages(guild_id, channel_id, author_id)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS index_state (
+                guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                oldest_message_id TEXT,
+                newest_message_id TEXT,
+                last_indexed_at TEXT,
+                status TEXT,
+                PRIMARY KEY (guild_id, channel_id)
+            )
+        """)
+        conn.commit()
+
+def summarize_history_attachments(message):
+    if not message.attachments:
+        return ""
+    return ", ".join(
+        f"{attachment.filename} ({attachment.size} bytes)"
+        for attachment in message.attachments
+    )
+
+def index_ai_history_message(message):
+    if not message.guild:
+        return
+    tools = get_ai_tools()
+    history_config = tools.get("channel_history", {})
+    if not history_config.get("enabled", True):
+        return
+    if message.author.bot and not history_config.get("index_bots", False):
+        return
+    init_ai_history_db()
+    created_at = message.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+    edited_at = message.edited_at
+    if edited_at and edited_at.tzinfo is None:
+        edited_at = edited_at.replace(tzinfo=datetime.timezone.utc)
+    with get_ai_history_connection() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO messages (
+                guild_id, channel_id, message_id, author_id, author_name,
+                created_at, edited_at, content, clean_content, attachment_summary,
+                reply_to_id, jump_url
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(message.guild.id),
+            str(message.channel.id),
+            str(message.id),
+            str(message.author.id),
+            getattr(message.author, "display_name", str(message.author)),
+            created_at.isoformat(),
+            edited_at.isoformat() if edited_at else None,
+            message.content or "",
+            message.clean_content or message.content or "",
+            summarize_history_attachments(message),
+            str(message.reference.message_id) if message.reference and message.reference.message_id else None,
+            getattr(message, "jump_url", "")
+        ))
+        conn.execute("""
+            INSERT OR REPLACE INTO index_state (
+                guild_id, channel_id, newest_message_id, last_indexed_at, status
+            )
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            str(message.guild.id),
+            str(message.channel.id),
+            str(message.id),
+            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "live"
+        ))
+        conn.commit()
+
+async def backfill_channel_history(channel, start_dt=None, end_dt=None, max_count=1000):
+    init_ai_history_db()
+    count = 0
+    oldest_id = None
+    newest_id = None
+    max_count = max(1, min(int(max_count or 1000), 200000))
+    async for history_message in channel.history(
+        limit=max_count,
+        after=start_dt,
+        before=end_dt,
+        oldest_first=True
+    ):
+        if not history_message.guild:
+            continue
+        index_ai_history_message(history_message)
+        count += 1
+        oldest_id = oldest_id or str(history_message.id)
+        newest_id = str(history_message.id)
+        if count % AI_HISTORY_INDEX_BATCH_SIZE == 0:
+            await asyncio.sleep(0)
+
+    if channel.guild:
+        with get_ai_history_connection() as conn:
+            current = conn.execute(
+                "SELECT oldest_message_id, newest_message_id FROM index_state WHERE guild_id = ? AND channel_id = ?",
+                (str(channel.guild.id), str(channel.id))
+            ).fetchone()
+            conn.execute("""
+                INSERT OR REPLACE INTO index_state (
+                    guild_id, channel_id, oldest_message_id, newest_message_id, last_indexed_at, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                str(channel.guild.id),
+                str(channel.id),
+                oldest_id or (current["oldest_message_id"] if current else None),
+                newest_id or (current["newest_message_id"] if current else None),
+                datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "backfilled"
+            ))
+            conn.commit()
+    return count
+
+def search_indexed_channel_history(guild_id, channel_id, query="", start_dt=None, end_dt=None, author_text="", limit=AI_HISTORY_DEFAULT_SEARCH_LIMIT):
+    init_ai_history_db()
+    where = ["guild_id = ?", "channel_id = ?"]
+    params = [str(guild_id), str(channel_id)]
+    query = (query or "").strip()
+    author_text = (author_text or "").strip()
+    if query:
+        like = f"%{query}%"
+        where.append("(clean_content LIKE ? OR content LIKE ? OR attachment_summary LIKE ?)")
+        params.extend([like, like, like])
+    if author_text:
+        where.append("(author_name LIKE ? OR author_id = ?)")
+        params.extend([f"%{author_text}%", author_text])
+    if start_dt:
+        where.append("created_at >= ?")
+        params.append(start_dt.isoformat())
+    if end_dt:
+        where.append("created_at <= ?")
+        params.append(end_dt.isoformat())
+
+    sql = f"""
+        SELECT * FROM messages
+        WHERE {' AND '.join(where)}
+        ORDER BY created_at DESC
+        LIMIT ?
+    """
+    params.append(max(1, min(int(limit or AI_HISTORY_DEFAULT_SEARCH_LIMIT), 50)))
+    with get_ai_history_connection() as conn:
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+def count_indexed_channel_history(guild_id, channel_id):
+    init_ai_history_db()
+    with get_ai_history_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM messages WHERE guild_id = ? AND channel_id = ?",
+            (str(guild_id), str(channel_id))
+        ).fetchone()
+        state = conn.execute(
+            "SELECT * FROM index_state WHERE guild_id = ? AND channel_id = ?",
+            (str(guild_id), str(channel_id))
+        ).fetchone()
+    return int(row["count"] if row else 0), dict(state) if state else None
+
+def format_history_result_line(row):
+    created = row.get("created_at") or ""
+    try:
+        created_dt = datetime.datetime.fromisoformat(created)
+        created = created_dt.astimezone(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        created = created[:16]
+    content = (row.get("clean_content") or row.get("content") or "").replace("\n", " ").strip()
+    attachments = row.get("attachment_summary") or ""
+    if attachments:
+        content = (content + " " if content else "") + f"[첨부: {attachments}]"
+    if not content:
+        content = "[내용 없음]"
+    jump_url = row.get("jump_url") or ""
+    suffix = f" ({jump_url})" if jump_url else ""
+    return f"{created} {row.get('author_name') or 'unknown'}: {truncate_for_prompt(content, 500)}{suffix}"
+
+def format_history_context(rows, max_chars=AI_HISTORY_MAX_CONTEXT_CHARS):
+    if not rows:
+        return ""
+    lines = ["[채널 기록 검색 결과]"]
+    for row in rows:
+        lines.append(format_history_result_line(row))
+    return truncate_for_prompt("\n".join(lines), max_chars)
+
+async def collect_recent_channel_history_context(channel, before=None, limit=50, max_chars=AI_HISTORY_MAX_CONTEXT_CHARS):
+    lines = ["[최근 채팅방 대화]"]
+    async for history_message in channel.history(limit=max(1, min(int(limit or 50), 200)), before=before, oldest_first=True):
+        if history_message.author.bot:
+            continue
+        content = (history_message.clean_content or history_message.content or "").replace("\n", " ").strip()
+        attachments = summarize_history_attachments(history_message)
+        if attachments:
+            content = (content + " " if content else "") + f"[첨부: {attachments}]"
+        if not content:
+            continue
+        created = history_message.created_at.astimezone(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")
+        lines.append(f"{created} {history_message.author.display_name}: {truncate_for_prompt(content, 500)}")
+    if len(lines) == 1:
+        return ""
+    return truncate_for_prompt("\n".join(lines), max_chars)
+
+def parse_ai_tool_directive(text):
+    clean = (text or "").strip()
+    for tool_name, prefixes in AI_TOOL_DIRECTIVE_PREFIXES.items():
+        for prefix in sorted(prefixes, key=len, reverse=True):
+            if clean == prefix:
+                return tool_name, ""
+            for separator in (" ", ":", "："):
+                marker = prefix + separator
+                if clean.startswith(marker):
+                    return tool_name, clean[len(marker):].strip()
+    return None, clean
+
+def should_auto_web_search(text, web_config):
+    if not web_config.get("auto_search", False):
+        return False
+    lowered = (text or "").lower()
+    triggers = ("검색", "인터넷", "웹에서", "최신", "오늘 기준", "뉴스", "출처", "링크")
+    return any(trigger in lowered for trigger in triggers)
+
+def is_ai_answer_uncertain(answer):
+    text = (answer or "").lower()
+    if not text:
+        return False
+    uncertain_patterns = (
+        "잘 모르",
+        "모르겠",
+        "알 수 없",
+        "확인할 수 없",
+        "정보가 없",
+        "자료가 없",
+        "제 지식",
+        "최신 정보",
+        "실시간",
+        "검색",
+        "인터넷",
+        "출처가 필요",
+        "정확하지 않을 수",
+        "확실하지 않",
+        "제공된 정보만으로",
+        "추가 정보가 필요"
+    )
+    return any(pattern in text for pattern in uncertain_patterns)
+
+def build_self_search_query(base_content, user_content, prompt_text):
+    for candidate in (user_content, base_content, prompt_text):
+        query = (candidate or "").strip()
+        if not query:
+            continue
+        query = re.sub(r"\[.*?\]", " ", query)
+        query = re.sub(r"\s+", " ", query).strip()
+        if query:
+            return truncate_for_prompt(query, 240)
+    return ""
+
+def should_auto_history_search(text, history_config):
+    if not history_config.get("auto_reference", False):
+        return False
+    triggers = ("예전에", "몇 년 전", "지난 대화", "채팅 기록", "대화 기록", "이 채널에서", "전에 말한")
+    return any(trigger in (text or "") for trigger in triggers)
+
+async def run_searxng_search(query, web_config):
+    if not web_config.get("enabled", False):
+        return [], "웹 검색 도구가 꺼져 있습니다. `/ai검색설정`으로 켤 수 있습니다."
+    if web_config.get("provider", "searxng") != "searxng":
+        return [], f"지원하지 않는 웹 검색 provider입니다: {web_config.get('provider')}"
+
+    base_url = (web_config.get("base_url") or "http://127.0.0.1:8080").rstrip("/")
+    max_results = max(1, min(int(web_config.get("max_results") or AI_WEB_SEARCH_MAX_RESULTS), 10))
+    timeout = aiohttp.ClientTimeout(total=max(5, int(web_config.get("timeout") or 15)))
+    params = {"q": query, "format": "json", "language": "ko-KR"}
+    urls = [f"{base_url}/search", base_url]
+    last_error = None
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for url in urls:
+            try:
+                async with session.get(url, params=params) as response:
+                    body = await response.text()
+                    if response.status >= 400:
+                        last_error = f"{response.status}: {body[:200]}"
+                        continue
+                    data = json.loads(body)
+                    results = []
+                    for item in data.get("results", [])[:max_results]:
+                        if not isinstance(item, dict):
+                            continue
+                        results.append({
+                            "title": item.get("title") or "제목 없음",
+                            "url": item.get("url") or "",
+                            "content": item.get("content") or item.get("snippet") or ""
+                        })
+                    return results, None
+            except Exception as error:
+                last_error = str(error)
+    return [], f"SearXNG 검색 실패: {last_error}"
+
+def format_web_search_context(query, results):
+    if not results:
+        return ""
+    lines = [f"[웹 검색 결과: {query}]"]
+    for index, item in enumerate(results, 1):
+        title = item.get("title") or "제목 없음"
+        url = item.get("url") or ""
+        content = (item.get("content") or "").replace("\n", " ").strip()
+        lines.append(f"{index}. {title}\nURL: {url}\n요약: {truncate_for_prompt(content, 600)}")
+    lines.append("답변에는 필요한 경우 위 URL을 출처로 함께 표시하세요.")
+    return truncate_for_prompt("\n\n".join(lines), 10000)
+
+async def build_ai_tool_context(message, config, base_content):
+    tools = get_ai_tools()
+    history_config = tools.get("channel_history", {})
+    web_config = tools.get("web_search", {})
+    directive, directive_text = parse_ai_tool_directive(base_content)
+    user_text = directive_text if directive in ("web", "history") and directive_text else base_content
+    context_blocks = []
+    notes = []
+    used_tools = set()
+
+    if directive == "web" or (directive is None and should_auto_web_search(base_content, web_config)):
+        query = directive_text or base_content
+        results, error = await run_searxng_search(query, web_config)
+        if error:
+            notes.append(error)
+        else:
+            context = format_web_search_context(query, results)
+            if context:
+                context_blocks.append(context)
+                used_tools.add("web")
+            notes.append(f"웹 검색 결과 {len(results)}개를 참고했습니다.")
+
+    if directive == "history" or (directive is None and should_auto_history_search(base_content, history_config)):
+        query = directive_text or base_content
+        if not history_config.get("enabled", True):
+            notes.append("채널 기록 검색 도구가 꺼져 있습니다.")
+        else:
+            limit = int(history_config.get("default_search_limit") or AI_HISTORY_DEFAULT_SEARCH_LIMIT)
+            rows = search_indexed_channel_history(message.guild.id, message.channel.id, query=query, limit=limit)
+            if rows:
+                context_blocks.append(format_history_context(rows, int(history_config.get("max_context_chars") or AI_HISTORY_MAX_CONTEXT_CHARS)))
+                used_tools.add("history")
+                notes.append(f"인덱싱된 채널 기록 {len(rows)}개를 참고했습니다.")
+            else:
+                recent_context = await collect_recent_channel_history_context(
+                    message.channel,
+                    before=message.created_at,
+                    limit=int(history_config.get("default_recent_limit") or 50),
+                    max_chars=int(history_config.get("max_context_chars") or AI_HISTORY_MAX_CONTEXT_CHARS)
+                )
+                if recent_context:
+                    context_blocks.append(recent_context)
+                    used_tools.add("history")
+                    notes.append("인덱싱 결과가 없어 최근 채팅 기록을 참고했습니다.")
+                else:
+                    notes.append("검색 가능한 채널 기록을 찾지 못했습니다. `/ai기록인덱스`로 과거 기록을 먼저 인덱싱하세요.")
+
+    return user_text, context_blocks, notes, used_tools
+
+async def maybe_retry_ai_with_self_search(
+    message,
+    config,
+    base_content,
+    user_content,
+    prompt_text,
+    answer,
+    image_payloads,
+    image_fallbacks,
+    memory_content,
+    has_documents,
+    used_tools
+):
+    tools = get_ai_tools()
+    web_config = tools.get("web_search", {})
+    if "web" in used_tools:
+        return None, None, None
+    if not web_config.get("enabled", False) or not web_config.get("search_on_uncertain", True):
+        return None, None, None
+    if not is_ai_answer_uncertain(answer):
+        return None, None, None
+
+    query = build_self_search_query(base_content, user_content, prompt_text)
+    if not query:
+        return None, None, None
+
+    results, error = await run_searxng_search(query, web_config)
+    if error or not results:
+        return None, None, error or "검색 결과가 없습니다."
+
+    search_context = format_web_search_context(query, results)
+    retry_prompt = (
+        f"{search_context}\n\n"
+        "[이전 답변]\n"
+        f"{truncate_for_prompt(answer, 2500)}\n\n"
+        "[사용자 요청]\n"
+        f"{user_content or base_content or prompt_text}\n\n"
+        "이전 답변이 불확실했으므로, 위 웹 검색 결과를 근거로 다시 답변하세요. "
+        "검색 결과로도 확인할 수 없는 내용은 확인 불가라고 말하고, 가능한 경우 출처 URL을 포함하세요."
+    )
+    retry_answer, retry_route = await run_ai_with_fallback(
+        message,
+        config,
+        retry_prompt,
+        image_payloads,
+        image_fallbacks,
+        memory_content,
+        has_documents=has_documents
+    )
+    retry_route = f"{retry_route} / 모르는 지식 자동 웹검색"
+    return retry_answer, retry_route, f"모르는 지식으로 판단해 웹 검색 결과 {len(results)}개를 추가 참고했습니다."
+
 def strip_bot_mention(content):
     if not bot.user:
         return content.strip()
@@ -1013,6 +1528,51 @@ async def send_ai_answer(message, answer, route=None, config=None):
                 await message.reply(chunk, mention_author=False)
             else:
                 await message.channel.send(chunk)
+
+def make_interaction_ai_context(interaction, content=""):
+    return types.SimpleNamespace(
+        guild=interaction.guild,
+        channel=interaction.channel,
+        author=interaction.user,
+        attachments=[],
+        clean_content=content,
+        content=content,
+        created_at=datetime.datetime.now(datetime.timezone.utc)
+    )
+
+async def send_ai_followup(interaction, answer, route=None, config=None, ephemeral=False):
+    context = make_interaction_ai_context(interaction)
+    answer = (answer or "").strip() or "(빈 응답)"
+    config = config or {}
+    reply_mode = config.get("reply_mode", "auto")
+    if reply_mode not in ("auto", "file", "split"):
+        reply_mode = "auto"
+    inline_limit = clamp_discord_inline_limit(config.get("reply_inline_limit", AI_REPLY_INLINE_LIMIT))
+
+    if reply_mode == "split" or (reply_mode == "auto" and len(answer) <= inline_limit):
+        for index, chunk in enumerate(split_discord_message(answer)):
+            await interaction.followup.send(chunk, ephemeral=ephemeral)
+        return
+
+    intro_prefix = "답변이 길어서 전체 내용은 텍스트 파일로 첨부했어요.\n\n미리보기:\n"
+    preview_limit = min(AI_REPLY_PREVIEW_LIMIT, max(100, DISCORD_SAFE_MESSAGE_LIMIT - len(intro_prefix) - 40))
+    preview = truncate_for_prompt(answer, preview_limit)
+    file_text = build_ai_answer_file_text(context, answer, route)
+    file_chunks = split_text_by_utf8_bytes(file_text, AI_REPLY_FILE_BYTE_LIMIT)
+    total = len(file_chunks)
+    intro = intro_prefix + preview
+    if len(intro) > DISCORD_SAFE_MESSAGE_LIMIT:
+        intro = intro[:DISCORD_SAFE_MESSAGE_LIMIT - 20].rstrip() + "\n..."
+
+    try:
+        for index, chunk in enumerate(file_chunks):
+            file_data = io.BytesIO(chunk.encode("utf-8"))
+            file = discord.File(file_data, filename=build_ai_answer_filename(index, total))
+            content = intro if index == 0 else f"긴 답변 이어서 첨부합니다. ({index + 1}/{total})"
+            await interaction.followup.send(content, file=file, ephemeral=ephemeral)
+    except Exception:
+        for chunk in split_discord_message(answer):
+            await interaction.followup.send(chunk, ephemeral=ephemeral)
 
 def clamp_percent(value, minimum=0, maximum=200):
     return max(minimum, min(maximum, int(value)))
@@ -2115,15 +2675,19 @@ async def probe_ai_model(config, model_name):
 async def handle_ai_reply(message, config, memory_content):
     async with message.channel.typing():
         base_content = strip_bot_mention(message.clean_content or message.content)
+        user_content, tool_contexts, tool_notes, used_tools = await build_ai_tool_context(message, config, base_content)
         text_blocks, image_payloads, image_fallbacks, notes = await process_ai_attachments(message.attachments)
 
         prompt_parts = []
-        if base_content:
-            prompt_parts.append(base_content)
+        if tool_contexts:
+            prompt_parts.extend(tool_contexts)
+        if user_content:
+            prompt_parts.append(user_content)
         if text_blocks:
             prompt_parts.append("\n\n".join(text_blocks))
-        if notes:
-            prompt_parts.append("[첨부 처리 정보]\n" + "\n".join(notes))
+        all_notes = tool_notes + notes
+        if all_notes:
+            prompt_parts.append("[처리 정보]\n" + "\n".join(all_notes))
         if not prompt_parts and image_payloads:
             prompt_parts.append("첨부된 이미지를 보고 사용자의 의도를 파악해 답변해 주세요.")
 
@@ -2146,6 +2710,28 @@ async def handle_ai_reply(message, config, memory_content):
             )
             return
 
+        try:
+            retry_answer, retry_route, retry_note = await maybe_retry_ai_with_self_search(
+                message,
+                config,
+                base_content,
+                user_content,
+                prompt_text,
+                answer,
+                image_payloads,
+                image_fallbacks,
+                memory_content,
+                bool(text_blocks),
+                used_tools
+            )
+            if retry_answer:
+                answer = retry_answer
+                route = retry_route
+                if retry_note:
+                    answer = f"{answer}\n\n> {retry_note}"
+        except Exception as error:
+            answer = f"{answer}\n\n> 자동 웹 검색 재시도 중 오류가 발생했습니다: {truncate_for_prompt(str(error), 300)}"
+
         append_ai_memory(
             AI_LONG_MEMORY_FILE,
             message.guild.id,
@@ -2164,11 +2750,7 @@ async def handle_ai_reply(message, config, memory_content):
             trim=AI_SHORT_MEMORY_LIMIT
         )
 
-        for index, chunk in enumerate(split_discord_message(answer)):
-            if index == 0:
-                await message.reply(chunk, mention_author=False)
-            else:
-                await message.channel.send(chunk)
+        await send_ai_answer(message, answer, route, config)
 
 async def maybe_handle_ai_message(message):
     if not message.guild:
@@ -2207,6 +2789,10 @@ async def maybe_handle_ai_message(message):
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot: return
+    try:
+        index_ai_history_message(message)
+    except Exception as error:
+        print(f"AI 채널 기록 인덱싱 실패: {error}")
 
     # --- [수정: 개인별 TTS 감지 및 옵션 적용 로직] ---
     tts_data = load_tts()
@@ -2819,6 +3405,229 @@ async def ai_response_settings(
         f"- 최대 생성 토큰: `{config['max_tokens']}`",
         ephemeral=True
     )
+
+@bot.tree.command(name="ai도구상태", description="AI 채널 기록/웹 검색 도구 상태를 확인합니다.")
+@app_commands.describe(채널="인덱싱 상태를 확인할 채널입니다. 비워두면 현재 채널입니다.")
+async def ai_tools_status(interaction: discord.Interaction, 채널: discord.TextChannel = None):
+    target_channel = 채널 or interaction.channel
+    tools = get_ai_tools()
+    history_config = tools.get("channel_history", {})
+    web_config = tools.get("web_search", {})
+    indexed_count, state = count_indexed_channel_history(interaction.guild_id, target_channel.id)
+    embed = discord.Embed(title="🧰 AI 도구 상태", color=discord.Color.blurple())
+    embed.add_field(
+        name="채널 기록",
+        value=(
+            f"사용: `{history_config.get('enabled', True)}`\n"
+            f"자동참고: `{history_config.get('auto_reference', False)}`\n"
+            f"DB: `{history_config.get('db_path', AI_HISTORY_DB_FILE)}`\n"
+            f"{target_channel.mention} 인덱스: `{indexed_count}`개"
+        ),
+        inline=False
+    )
+    if state:
+        embed.add_field(
+            name="인덱스 상태",
+            value=f"상태: `{state.get('status')}`\n마지막 갱신: `{state.get('last_indexed_at')}`",
+            inline=False
+        )
+    embed.add_field(
+        name="웹 검색",
+        value=(
+            f"사용: `{web_config.get('enabled', False)}`\n"
+            f"자동검색: `{web_config.get('auto_search', False)}`\n"
+            f"모를 때 검색: `{web_config.get('search_on_uncertain', True)}`\n"
+            f"Provider: `{web_config.get('provider', 'searxng')}`\n"
+            f"URL: `{web_config.get('base_url', 'http://127.0.0.1:8080')}`"
+        ),
+        inline=False
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="ai검색설정", description="AI 웹 검색 도구 사용 여부를 설정합니다.")
+@app_commands.describe(
+    사용="SearXNG 로컬 웹 검색을 켤지 선택합니다.",
+    자동검색="대화 중 검색 필요 표현을 감지해 자동 검색할지 선택합니다.",
+    모르면검색="AI 답변이 불확실하면 한 번 웹 검색 후 다시 답변할지 선택합니다.",
+    결과개수="검색 결과 최대 개수입니다. 1~10"
+)
+async def ai_search_settings(
+    interaction: discord.Interaction,
+    사용: bool = True,
+    자동검색: bool = False,
+    모르면검색: bool = True,
+    결과개수: int = AI_WEB_SEARCH_MAX_RESULTS
+):
+    if not can_manage_ai_settings(interaction.user):
+        await interaction.response.send_message("❌ 서버 관리 권한 또는 오너 권한이 필요합니다.", ephemeral=True)
+        return
+    tools = get_ai_tools()
+    tools.setdefault("web_search", {})
+    tools["web_search"]["enabled"] = bool(사용)
+    tools["web_search"]["auto_search"] = bool(자동검색)
+    tools["web_search"]["search_on_uncertain"] = bool(모르면검색)
+    tools["web_search"]["max_results"] = max(1, min(int(결과개수), 10))
+    save_ai_tools(tools)
+    await interaction.response.send_message(
+        f"✅ AI 웹 검색 설정을 저장했습니다.\n"
+        f"- 사용: `{tools['web_search']['enabled']}`\n"
+        f"- 자동검색: `{tools['web_search']['auto_search']}`\n"
+        f"- 모를 때 검색: `{tools['web_search']['search_on_uncertain']}`\n"
+        f"- 결과 개수: `{tools['web_search']['max_results']}`\n"
+        f"- SearXNG URL은 서버의 `ai_tools.json`에서 관리합니다.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="ai기록설정", description="AI 채널 기록 검색/자동참고 설정을 변경합니다.")
+@app_commands.describe(
+    사용="채널 기록 인덱스와 검색 도구를 켤지 선택합니다.",
+    자동참고="대화 중 과거 기록 요청 표현을 감지해 자동으로 검색할지 선택합니다.",
+    기본검색개수="AI 프롬프트에 붙일 기록 검색 결과 개수입니다. 1~50"
+)
+async def ai_history_settings(
+    interaction: discord.Interaction,
+    사용: bool = True,
+    자동참고: bool = False,
+    기본검색개수: int = AI_HISTORY_DEFAULT_SEARCH_LIMIT
+):
+    if not can_manage_ai_settings(interaction.user):
+        await interaction.response.send_message("❌ 서버 관리 권한 또는 오너 권한이 필요합니다.", ephemeral=True)
+        return
+    tools = get_ai_tools()
+    tools.setdefault("channel_history", {})
+    tools["channel_history"]["enabled"] = bool(사용)
+    tools["channel_history"]["auto_reference"] = bool(자동참고)
+    tools["channel_history"]["default_search_limit"] = max(1, min(int(기본검색개수), 50))
+    save_ai_tools(tools)
+    await interaction.response.send_message(
+        f"✅ AI 채널 기록 설정을 저장했습니다.\n"
+        f"- 사용: `{tools['channel_history']['enabled']}`\n"
+        f"- 자동참고: `{tools['channel_history']['auto_reference']}`\n"
+        f"- 기본 검색 개수: `{tools['channel_history']['default_search_limit']}`",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="ai기록인덱스", description="채널 과거 대화를 SQLite 검색 DB에 인덱싱합니다.")
+@app_commands.describe(
+    채널="인덱싱할 채널입니다. 비워두면 현재 채널입니다.",
+    시작일="예: 2024-01-01 또는 2024-01-01 12:00. 비우면 제한 없음",
+    종료일="예: 2026-06-01. 비우면 제한 없음",
+    최대개수="가져올 최대 메시지 수입니다. 오래된 채널은 여러 번 나눠 실행하세요."
+)
+async def ai_history_index(
+    interaction: discord.Interaction,
+    채널: discord.TextChannel = None,
+    시작일: str = "",
+    종료일: str = "",
+    최대개수: int = 5000
+):
+    if not can_manage_ai_settings(interaction.user):
+        await interaction.response.send_message("❌ 서버 관리 권한 또는 오너 권한이 필요합니다.", ephemeral=True)
+        return
+    target_channel = 채널 or interaction.channel
+    permissions = target_channel.permissions_for(interaction.guild.me)
+    if not permissions.read_message_history:
+        await interaction.response.send_message("❌ 봇에 `Read Message History` 권한이 없습니다.", ephemeral=True)
+        return
+    start_dt = parse_user_datetime(시작일)
+    end_dt = parse_user_datetime(종료일)
+    if 시작일 and not start_dt:
+        await interaction.response.send_message("❌ 시작일 형식을 읽지 못했습니다. 예: `2024-01-01`", ephemeral=True)
+        return
+    if 종료일 and not end_dt:
+        await interaction.response.send_message("❌ 종료일 형식을 읽지 못했습니다. 예: `2026-06-01`", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    count = await backfill_channel_history(target_channel, start_dt=start_dt, end_dt=end_dt, max_count=최대개수)
+    indexed_count, state = count_indexed_channel_history(interaction.guild_id, target_channel.id)
+    await interaction.followup.send(
+        f"✅ {target_channel.mention} 기록 인덱싱 완료\n"
+        f"- 이번 작업: `{count}`개\n"
+        f"- 누적 인덱스: `{indexed_count}`개\n"
+        f"- 상태: `{state.get('status') if state else 'unknown'}`",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="ai기록검색", description="인덱싱된 채널 기록을 검색하고 필요하면 AI가 정리합니다.")
+@app_commands.describe(
+    검색어="찾을 키워드입니다.",
+    질문="검색 결과를 바탕으로 AI에게 물어볼 질문입니다. 비우면 검색 결과만 보여줍니다.",
+    채널="검색할 채널입니다. 비워두면 현재 채널입니다.",
+    시작일="검색 시작일입니다. 예: 2024-01-01",
+    종료일="검색 종료일입니다. 예: 2026-06-01",
+    작성자="작성자 이름 일부 또는 사용자 ID입니다.",
+    결과개수="검색 결과 개수입니다. 1~50",
+    비공개="결과를 본인에게만 보낼지 선택합니다."
+)
+async def ai_history_search(
+    interaction: discord.Interaction,
+    검색어: str,
+    질문: str = "",
+    채널: discord.TextChannel = None,
+    시작일: str = "",
+    종료일: str = "",
+    작성자: str = "",
+    결과개수: int = AI_HISTORY_DEFAULT_SEARCH_LIMIT,
+    비공개: bool = True
+):
+    target_channel = 채널 or interaction.channel
+    start_dt = parse_user_datetime(시작일)
+    end_dt = parse_user_datetime(종료일)
+    await interaction.response.defer(ephemeral=비공개, thinking=True)
+    rows = search_indexed_channel_history(
+        interaction.guild_id,
+        target_channel.id,
+        query=검색어,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        author_text=작성자,
+        limit=결과개수
+    )
+    if not rows:
+        await interaction.followup.send("검색 결과가 없습니다. 오래된 기록은 `/ai기록인덱스`를 먼저 실행해야 합니다.", ephemeral=비공개)
+        return
+    context = format_history_context(rows)
+    if not 질문:
+        await send_ai_followup(interaction, context, "channel_history", get_ai_channel_config(interaction.guild_id, target_channel.id), ephemeral=비공개)
+        return
+    config = get_ai_channel_config(interaction.guild_id, target_channel.id)
+    prompt_text = f"{context}\n\n[사용자 요청]\n{질문}"
+    context_message = make_interaction_ai_context(interaction, 질문)
+    try:
+        answer, route = await run_ai_with_fallback(context_message, config, prompt_text, [], [], 질문, has_documents=True)
+        await send_ai_followup(interaction, answer, route, config, ephemeral=비공개)
+    except Exception as error:
+        await interaction.followup.send(f"❌ AI 기록 검색 답변 실패:\n`{truncate_for_prompt(str(error), 1200)}`", ephemeral=비공개)
+
+@bot.tree.command(name="ai검색", description="SearXNG 로컬 웹 검색 결과를 바탕으로 AI가 답변합니다.")
+@app_commands.describe(
+    검색어="웹에서 검색할 내용입니다.",
+    질문="검색 결과로 AI에게 물어볼 질문입니다. 비우면 검색어를 질문으로 사용합니다.",
+    비공개="결과를 본인에게만 보낼지 선택합니다."
+)
+async def ai_web_search(
+    interaction: discord.Interaction,
+    검색어: str,
+    질문: str = "",
+    비공개: bool = False
+):
+    await interaction.response.defer(ephemeral=비공개, thinking=True)
+    tools = get_ai_tools()
+    web_config = tools.get("web_search", {})
+    results, error = await run_searxng_search(검색어, web_config)
+    if error:
+        await interaction.followup.send(f"❌ 웹 검색 실패: {error}", ephemeral=비공개)
+        return
+    context = format_web_search_context(검색어, results)
+    config = get_ai_channel_config(interaction.guild_id, interaction.channel.id)
+    question = 질문 or f"`{검색어}` 검색 결과를 바탕으로 핵심을 정리해줘."
+    prompt_text = f"{context}\n\n[사용자 요청]\n{question}"
+    context_message = make_interaction_ai_context(interaction, question)
+    try:
+        answer, route = await run_ai_with_fallback(context_message, config, prompt_text, [], [], question, has_documents=True)
+        await send_ai_followup(interaction, answer, route, config, ephemeral=비공개)
+    except Exception as error:
+        await interaction.followup.send(f"❌ AI 웹 검색 답변 실패:\n`{truncate_for_prompt(str(error), 1200)}`", ephemeral=비공개)
 
 @bot.tree.command(name="ai모델목록", description="등록된 로컬 LLM 모델 프로필과 기능을 확인합니다.")
 async def ai_model_list(interaction: discord.Interaction):

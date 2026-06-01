@@ -1,0 +1,15 @@
+name: puangbot-search
+
+services:
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: puangbot-searxng
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://127.0.0.1:8080/
+      - UWSGI_WORKERS=2
+      - UWSGI_THREADS=2
+    restart: unless-stopped

@@ -10,9 +10,14 @@ volume_settings.json
 ai_settings.json
 ai_providers.json
 ai_models.json
+ai_tools.json
+ai_history.sqlite3
+ai_history.sqlite3-*
 ai_usage_log.jsonl
 ai_short_memory.json
 ai_long_memory.json
+infra/searxng/searxng/settings.yml
+infra/searxng/searxng/*.log
 
 # FFmpeg 및 자동 다운로드 임시 파일들
 ffmpeg.exe

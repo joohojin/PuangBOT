@@ -8,6 +8,15 @@ Write-Host "== Python =="
 python --version
 
 Write-Host ""
+Write-Host "== Bootstrap =="
+python "bootstrap_puang.py"
+if ($LASTEXITCODE -ne 0) {
+  Write-Host "PuangBOT bootstrap: FAILED"
+} else {
+  Write-Host "PuangBOT bootstrap: OK"
+}
+
+Write-Host ""
 Write-Host "== Syntax =="
 $compileTarget = Join-Path $env:TEMP "PuangBOT_diagnostic.pyc"
 python -c "import py_compile; py_compile.compile(r'Puang.py', cfile=r'$compileTarget', doraise=True)"
@@ -21,6 +30,8 @@ Write-Host ""
 Write-Host "== Python packages =="
 $modules = @(
   "discord",
+  "nacl",
+  "audioop",
   "yt_dlp",
   "edge_tts",
   "gtts",
@@ -28,8 +39,7 @@ $modules = @(
   "mcrcon",
   "PIL",
   "pytesseract",
-  "pypdf",
-  "PyPDF2"
+  "pypdf"
 )
 
 foreach ($module in $modules) {
@@ -61,6 +71,7 @@ Write-Host "== Local files =="
 $files = @(
   "token.txt",
   "requirements.txt",
+  "bootstrap_puang.py",
   "ai_models.example.json",
   "run_puang.cmd",
   "install_python_deps.cmd",

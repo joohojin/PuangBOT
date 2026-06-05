@@ -1,0 +1,15 @@
+{
+  "minecraft": {
+    "rcon_host": "127.0.0.1",
+    "rcon_port": 25575,
+    "rcon_password_env": "PUANG_RCON_PASSWORD",
+    "mc_root_dir": "server/mc",
+    "playit_dir": "server",
+    "playit_link": "playit.gg.lnk"
+  },
+  "startup": {
+    "auto_setup_ffmpeg": true,
+    "auto_setup_edge_tts": false,
+    "auto_start_searxng": true
+  }
+}

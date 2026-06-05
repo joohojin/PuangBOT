@@ -2,6 +2,20 @@
 setlocal
 cd /d "%~dp0"
 
+where docker >nul 2>nul
+if errorlevel 1 (
+  echo Docker was not found. Skipping local SearXNG setup.
+  echo Install Docker Desktop later if you want local AI web search through SearXNG.
+  exit /b 1
+)
+
+docker compose version >nul 2>nul
+if errorlevel 1 (
+  echo Docker Compose was not found or is not available through "docker compose".
+  echo Install/repair Docker Desktop later if you want local AI web search through SearXNG.
+  exit /b 1
+)
+
 if not exist "searxng" mkdir "searxng"
 
 if exist "searxng\settings.yml" (

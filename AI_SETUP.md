@@ -15,11 +15,43 @@
 - 모델 프로필 파일: `ai_models.json`
 - Provider 설정 파일: `ai_providers.json`
 - AI 도구 설정 파일: `ai_tools.json`
+- 서버/RCON 설정 파일: `server_settings.json`
 - 채널 기록 검색 DB: `ai_history.sqlite3`
 - 단기 기억 파일: `ai_short_memory.json`
 - 장기 기억 파일: `ai_long_memory.json`
 
-위 JSON 파일들은 런타임 설정/기억 파일이라 `.gitignore`에 포함되어 있다.
+위 JSON 파일들은 런타임 설정/기억 파일이라 `.gitignore`에 포함되어 있다. 예시 파일은 `*.example.json`으로 제공된다.
+
+## 0. 서버/RCON 설정
+
+마인크래프트 RCON 비밀번호는 더 이상 `Puang.py`에 직접 넣지 않는다. 서버에서 환경변수로 설정하는 방식을 권장한다.
+
+```bat
+setx PUANG_RCON_PASSWORD "server.properties에 설정한 rcon.password"
+```
+
+현재 터미널에 바로 적용하려면 새 터미널을 열거나 아래처럼 임시 설정한다.
+
+```bat
+set PUANG_RCON_PASSWORD=server.properties에_설정한_rcon.password
+```
+
+서버 경로와 RCON 포트를 바꾸려면 `server_settings.example.json`을 `server_settings.json`으로 복사한 뒤 수정한다.
+
+```json
+{
+  "minecraft": {
+    "rcon_host": "127.0.0.1",
+    "rcon_port": 25575,
+    "rcon_password_env": "PUANG_RCON_PASSWORD",
+    "mc_root_dir": "server/mc",
+    "playit_dir": "server",
+    "playit_link": "playit.gg.lnk"
+  }
+}
+```
+
+`server_settings.json`은 런타임 파일이라 git에 올리지 않는다.
 
 ## 1. Python 패키지 설치
 
@@ -114,9 +146,13 @@ http://127.0.0.1:8080/search?q=ollama&format=json&language=ko-KR
 Discord에서 검색 도구를 켠다.
 
 ```text
-/ai검색설정 사용:True 자동검색:False 모르면검색:True 결과개수:5
+/ai도구마이그레이션
+/ai검색설정 사용:True 자동검색:False 모르면검색:True 기본provider:searxng-local 이미지provider:searxng-local 상세검색:False 결과개수:5
 /ai도구상태
-/ai검색 검색어:Ollama SearXNG 연결 방법
+/ai검색 검색어:Ollama SearXNG 연결 방법 종류:웹 provider:auto
+/ai검색 검색어:Ollama SearXNG 연결 방법 종류:웹 provider:auto 상세검색:True
+/ai검색 검색어:Gemma4 종류:이미지 provider:searxng-local
+/ai검색 검색어:오늘 AI 뉴스 종류:뉴스 provider:auto
 ```
 
 맨션 뒤 수동 검색도 가능하다.
@@ -124,14 +160,54 @@ Discord에서 검색 도구를 켠다.
 ```text
 @푸앙봇 검색 Gemma4 Ollama 사용법
 @푸앙봇 /검색 마인크래프트 서버 최적화 최신 정보
+@푸앙봇 뉴스검색 오늘 AI 뉴스
+@푸앙봇 이미지검색 검은색 게이밍 키보드
+@푸앙봇 영상검색 Ollama 튜토리얼
+@푸앙봇 렌즈검색 이 이미지 원본 찾아줘 + 이미지 첨부
 ```
 
-`ai_tools.json` 기본값은 안전하게 웹 검색이 꺼져 있다. SearXNG 포트를 바꾸면 `ai_tools.json`의
-`web_search.base_url`도 같은 주소로 바꾼다.
+`ai_tools.json` 기본값은 안전하게 검색이 꺼져 있다. SearXNG 포트를 바꾸면 `ai_tools.json`의
+`search.providers.searxng-local.base_url`도 같은 주소로 바꾼다.
+
+검색 provider 구조:
+
+```text
+searxng-local: 로컬 SearXNG, web/news/image/video
+duckduckgo-lite: Docker/API 키 없이 쓰는 DuckDuckGo Lite HTML 검색, web/news
+brave-api: Brave Search API, web/news/image/video, BRAVE_SEARCH_API_KEY 필요
+google-cse: Google Custom Search JSON API, web/image, GOOGLE_SEARCH_API_KEY와 GOOGLE_SEARCH_CX 필요
+serpapi-lens: SerpAPI Google Lens, lens, SERPAPI_API_KEY 필요
+```
+
+Provider의 URL/API 키/활성화 여부는 Discord 명령어가 아니라 서버의 `ai_tools.json`에서 직접 관리한다.
+Discord에서는 `/ai검색`의 `provider` 옵션으로 이미 등록된 provider ID만 선택한다.
+Docker가 설치되어 있지 않거나 SearXNG가 아직 준비되지 않은 서버에서는 `duckduckgo-lite`를 기본 provider로 두면 즉시 웹 검색이 가능하다.
+이 방식은 검색어가 DuckDuckGo로 전송되는 외부 검색이다. 완전 로컬 검색을 원하면 Docker/SearXNG를 준비한 뒤 기본 provider를 `searxng-local`로 되돌린다.
+
+상세검색을 켜면 검색 결과의 상위 URL 본문 일부를 HTTP로 가져와 `본문 발췌` 블록으로 Ollama에 전달한다.
+이 값은 `ai_tools.json`의 `search.fetch_pages`, `search.fetch_page_limit`, `search.page_max_chars`,
+`search.context_max_chars`로 조절한다. 기본값은 빠른 검색을 위해 `fetch_pages: false`이고,
+`/ai검색 상세검색:True`를 주면 해당 요청에서만 강제로 본문 발췌를 수행한다.
+같은 URL 반복 접근을 줄이기 위해 프로세스 메모리 캐시가 적용되며, `search.cache_enabled`,
+`search.cache_ttl_seconds`로 조절한다.
+
+Ollama 전달 구조:
+
+```text
+[웹/뉴스/이미지/영상 검색 결과]
+1. 제목
+URL: ...
+요약: ...
+본문 발췌: ...  # 상세검색일 때만
+
+[사용자 요청]
+검색 결과를 바탕으로 답변...
+```
 
 `모르면검색`이 켜져 있으면 푸앙봇이 먼저 로컬 모델로 답변을 시도한 뒤, 답변에 "잘 모르겠다",
-"확인할 수 없다", "최신 정보가 필요하다" 같은 불확실 표현이 포함될 때 한 번만 SearXNG로 검색하고
-검색 결과를 붙여 다시 답변한다. 명시적으로 `검색 ...` 또는 `/ai검색`을 사용한 경우에는 중복 검색하지 않는다.
+"확인할 수 없다", "최신 정보가 필요하다", "현재 기준 확인 필요" 같은 불확실 표현이 포함될 때 한 번만 등록된 검색 provider로 검색하고
+검색 결과를 붙여 다시 답변한다. 이때 `search.fetch_pages_on_uncertain`이 true면 본문 발췌까지 추가한다.
+명시적으로 `검색 ...` 또는 `/ai검색`을 사용한 경우에는 중복 검색하지 않는다.
 
 ## 5. 모델 프로필 커스터마이징
 

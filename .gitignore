@@ -11,6 +11,7 @@ ai_settings.json
 ai_providers.json
 ai_models.json
 ai_tools.json
+server_settings.json
 ai_history.sqlite3
 ai_history.sqlite3-*
 ai_usage_log.jsonl

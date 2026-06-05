@@ -17,5 +17,65 @@
     "max_results": 5,
     "timeout": 15,
     "fetch_pages": false
+  },
+  "search": {
+    "enabled": false,
+    "auto_search": false,
+    "search_on_uncertain": true,
+    "default_provider": "searxng-local",
+    "image_provider": "searxng-local",
+    "lens_provider": "serpapi-lens",
+    "max_results": 5,
+    "timeout": 15,
+    "fetch_pages": false,
+    "fetch_pages_on_uncertain": true,
+    "fetch_page_limit": 3,
+    "page_max_chars": 2500,
+    "context_max_chars": 16000,
+    "cache_enabled": true,
+    "cache_ttl_seconds": 86400,
+    "providers": {
+      "searxng-local": {
+        "type": "searxng",
+        "enabled": true,
+        "base_url": "http://127.0.0.1:8080",
+        "supports": ["web", "news", "image", "video"],
+        "privacy": "local",
+        "timeout": 15
+      },
+      "duckduckgo-lite": {
+        "type": "duckduckgo_lite",
+        "enabled": true,
+        "base_url": "https://lite.duckduckgo.com/lite/",
+        "supports": ["web", "news"],
+        "privacy": "external",
+        "timeout": 15
+      },
+      "brave-api": {
+        "type": "brave",
+        "enabled": false,
+        "api_key_env": "BRAVE_SEARCH_API_KEY",
+        "supports": ["web", "news", "image", "video"],
+        "privacy": "external",
+        "timeout": 15
+      },
+      "google-cse": {
+        "type": "google_cse",
+        "enabled": false,
+        "api_key_env": "GOOGLE_SEARCH_API_KEY",
+        "cx_env": "GOOGLE_SEARCH_CX",
+        "supports": ["web", "image"],
+        "privacy": "external",
+        "timeout": 15
+      },
+      "serpapi-lens": {
+        "type": "serpapi_lens",
+        "enabled": false,
+        "api_key_env": "SERPAPI_API_KEY",
+        "supports": ["lens"],
+        "privacy": "external",
+        "timeout": 20
+      }
+    }
   }
 }

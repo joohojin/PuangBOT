@@ -21,8 +21,11 @@ import io
 import re
 import sqlite3
 import types
+import copy
+import html as html_lib
 import xml.etree.ElementTree as ET
 from array import array
+from html.parser import HTMLParser
 from queue import Empty, Queue
 import aiohttp
 from discord.ext import tasks
@@ -47,6 +50,7 @@ import json
 
 TTS_FILE = "tts_settings.json"
 VOLUME_FILE = "volume_settings.json"
+SERVER_SETTINGS_FILE = "server_settings.json"
 AI_SETTINGS_FILE = "ai_settings.json"
 AI_PROVIDERS_FILE = "ai_providers.json"
 AI_MODELS_FILE = "ai_models.json"
@@ -77,8 +81,19 @@ AI_HISTORY_DEFAULT_SEARCH_LIMIT = 8
 AI_HISTORY_MAX_CONTEXT_CHARS = 12000
 AI_HISTORY_INDEX_BATCH_SIZE = 100
 AI_WEB_SEARCH_MAX_RESULTS = 5
+AI_SEARCH_TYPES = ("web", "news", "image", "video", "lens")
+AI_SEARCH_CONTEXT_MAX_CHARS = 16000
+AI_SEARCH_PAGE_FETCH_LIMIT = 3
+AI_SEARCH_PAGE_MAX_CHARS = 2500
+AI_SEARCH_PAGE_MAX_BYTES = 512 * 1024
+AI_SEARCH_CACHE_TTL_SECONDS = 24 * 60 * 60
+AI_SEARCH_PAGE_CACHE = {}
 AI_TOOL_DIRECTIVE_PREFIXES = {
     "web": ("/검색", "검색", "웹검색", "인터넷검색"),
+    "news": ("/뉴스검색", "뉴스검색", "뉴스"),
+    "image": ("/이미지검색", "이미지검색", "사진검색", "그림검색"),
+    "video": ("/영상검색", "영상검색", "동영상검색", "유튜브검색"),
+    "lens": ("/렌즈검색", "렌즈검색", "원본검색", "유사이미지검색"),
     "history": ("/기록검색", "기록검색", "대화검색", "채팅검색")
 }
 AI_ALLOWED_TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".yml", ".yaml"}
@@ -159,6 +174,66 @@ def get_default_ai_tools():
             "max_results": AI_WEB_SEARCH_MAX_RESULTS,
             "timeout": 15,
             "fetch_pages": False
+        },
+        "search": {
+            "enabled": False,
+            "auto_search": False,
+            "search_on_uncertain": True,
+            "default_provider": "searxng-local",
+            "image_provider": "searxng-local",
+            "lens_provider": "serpapi-lens",
+            "max_results": AI_WEB_SEARCH_MAX_RESULTS,
+            "timeout": 15,
+            "fetch_pages": False,
+            "fetch_pages_on_uncertain": True,
+            "fetch_page_limit": AI_SEARCH_PAGE_FETCH_LIMIT,
+            "page_max_chars": AI_SEARCH_PAGE_MAX_CHARS,
+            "context_max_chars": AI_SEARCH_CONTEXT_MAX_CHARS,
+            "cache_enabled": True,
+            "cache_ttl_seconds": AI_SEARCH_CACHE_TTL_SECONDS,
+            "providers": {
+                "searxng-local": {
+                    "type": "searxng",
+                    "enabled": True,
+                    "base_url": "http://127.0.0.1:8080",
+                    "supports": ["web", "news", "image", "video"],
+                    "privacy": "local",
+                    "timeout": 15
+                },
+                "duckduckgo-lite": {
+                    "type": "duckduckgo_lite",
+                    "enabled": True,
+                    "base_url": "https://lite.duckduckgo.com/lite/",
+                    "supports": ["web", "news"],
+                    "privacy": "external",
+                    "timeout": 15
+                },
+                "brave-api": {
+                    "type": "brave",
+                    "enabled": False,
+                    "api_key_env": "BRAVE_SEARCH_API_KEY",
+                    "supports": ["web", "news", "image", "video"],
+                    "privacy": "external",
+                    "timeout": 15
+                },
+                "google-cse": {
+                    "type": "google_cse",
+                    "enabled": False,
+                    "api_key_env": "GOOGLE_SEARCH_API_KEY",
+                    "cx_env": "GOOGLE_SEARCH_CX",
+                    "supports": ["web", "image"],
+                    "privacy": "external",
+                    "timeout": 15
+                },
+                "serpapi-lens": {
+                    "type": "serpapi_lens",
+                    "enabled": False,
+                    "api_key_env": "SERPAPI_API_KEY",
+                    "supports": ["lens"],
+                    "privacy": "external",
+                    "timeout": 20
+                }
+            }
         }
     }
 
@@ -170,13 +245,51 @@ def get_ai_tools():
 
     merged = {}
     for key, value in defaults.items():
-        merged[key] = value.copy()
+        merged[key] = copy.deepcopy(value)
         if isinstance(data.get(key), dict):
             merged[key].update(data[key])
+            if key == "search":
+                providers = copy.deepcopy(value.get("providers", {}))
+                custom_providers = data[key].get("providers", {})
+                if isinstance(custom_providers, dict):
+                    for provider_id, provider in custom_providers.items():
+                        if isinstance(provider, dict):
+                            base = copy.deepcopy(providers.get(provider_id, {}))
+                            base.update(provider)
+                            providers[provider_id] = base
+                merged[key]["providers"] = providers
+    legacy_web = merged.get("web_search", {})
+    search = merged.setdefault("search", defaults["search"].copy())
+    if "search" not in data and legacy_web:
+        search["enabled"] = bool(legacy_web.get("enabled", search.get("enabled", False)))
+        search["auto_search"] = bool(legacy_web.get("auto_search", search.get("auto_search", False)))
+        search["search_on_uncertain"] = bool(legacy_web.get("search_on_uncertain", search.get("search_on_uncertain", True)))
+        search["max_results"] = int(legacy_web.get("max_results", search.get("max_results", AI_WEB_SEARCH_MAX_RESULTS)))
+        search["timeout"] = int(legacy_web.get("timeout", search.get("timeout", 15)))
+        providers = search.setdefault("providers", defaults["search"]["providers"].copy())
+        searxng = providers.setdefault("searxng-local", defaults["search"]["providers"]["searxng-local"].copy())
+        searxng["enabled"] = bool(legacy_web.get("enabled", searxng.get("enabled", True)))
+        searxng["base_url"] = legacy_web.get("base_url", searxng.get("base_url", "http://127.0.0.1:8080"))
+        searxng["timeout"] = int(legacy_web.get("timeout", searxng.get("timeout", 15)))
     return merged
 
 def save_ai_tools(data):
     save_json_file(AI_TOOLS_FILE, data)
+
+def get_ai_tools_schema_warnings():
+    data = load_json_file(AI_TOOLS_FILE, None)
+    if not isinstance(data, dict):
+        return [f"`{AI_TOOLS_FILE}`이 없거나 JSON 객체가 아니어서 기본값으로 동작 중입니다."]
+
+    warnings = []
+    search = data.get("search")
+    if not isinstance(search, dict):
+        warnings.append("런타임 설정이 구형 `web_search` 중심입니다. `/ai검색설정`을 한 번 저장하거나 `ai_tools.example.json` 기준으로 `search` 블록을 추가하세요.")
+    elif not isinstance(search.get("providers"), dict):
+        warnings.append("`search.providers`가 없어 기본 provider 병합값으로 동작 중입니다. 서버에서 `ai_tools.json`에 provider 목록을 명시하는 것을 권장합니다.")
+    if isinstance(search, dict) and "fetch_pages_on_uncertain" not in search:
+        warnings.append("`search.fetch_pages_on_uncertain`이 없어 기본값으로 동작 중입니다.")
+    return warnings
 
 def get_default_ai_providers():
     return {
@@ -908,6 +1021,13 @@ def parse_ai_tool_directive(text):
                     return tool_name, clean[len(marker):].strip()
     return None, clean
 
+def get_first_image_attachment_url(attachments):
+    for attachment in attachments or []:
+        ext = os.path.splitext(attachment.filename or "")[1].lower()
+        if ext in AI_ALLOWED_IMAGE_EXTENSIONS or (attachment.content_type or "").startswith("image/"):
+            return getattr(attachment, "url", "") or getattr(attachment, "proxy_url", "")
+    return ""
+
 def should_auto_web_search(text, web_config):
     if not web_config.get("auto_search", False):
         return False
@@ -929,8 +1049,9 @@ def is_ai_answer_uncertain(answer):
         "제 지식",
         "최신 정보",
         "실시간",
-        "검색",
-        "인터넷",
+        "현재 기준",
+        "오늘 기준",
+        "공식 문서",
         "출처가 필요",
         "정확하지 않을 수",
         "확실하지 않",
@@ -956,16 +1077,304 @@ def should_auto_history_search(text, history_config):
     triggers = ("예전에", "몇 년 전", "지난 대화", "채팅 기록", "대화 기록", "이 채널에서", "전에 말한")
     return any(trigger in (text or "") for trigger in triggers)
 
-async def run_searxng_search(query, web_config):
-    if not web_config.get("enabled", False):
-        return [], "웹 검색 도구가 꺼져 있습니다. `/ai검색설정`으로 켤 수 있습니다."
-    if web_config.get("provider", "searxng") != "searxng":
-        return [], f"지원하지 않는 웹 검색 provider입니다: {web_config.get('provider')}"
+def normalize_search_type(search_type):
+    value = (search_type or "web").strip().lower()
+    aliases = {
+        "웹": "web",
+        "일반": "web",
+        "뉴스": "news",
+        "이미지": "image",
+        "사진": "image",
+        "영상": "video",
+        "동영상": "video",
+        "렌즈": "lens",
+        "원본": "lens"
+    }
+    value = aliases.get(value, value)
+    return value if value in AI_SEARCH_TYPES else "web"
 
-    base_url = (web_config.get("base_url") or "http://127.0.0.1:8080").rstrip("/")
-    max_results = max(1, min(int(web_config.get("max_results") or AI_WEB_SEARCH_MAX_RESULTS), 10))
-    timeout = aiohttp.ClientTimeout(total=max(5, int(web_config.get("timeout") or 15)))
+def infer_search_type(text, has_images=False):
+    lowered = (text or "").lower()
+    if has_images and any(keyword in lowered for keyword in ("원본", "비슷", "유사", "렌즈", "어디", "찾아")):
+        return "lens"
+    if any(keyword in lowered for keyword in ("뉴스", "오늘", "최신", "속보")):
+        return "news"
+    if any(keyword in lowered for keyword in ("이미지", "사진", "그림")):
+        return "image"
+    if any(keyword in lowered for keyword in ("영상", "동영상", "유튜브", "youtube")):
+        return "video"
+    return "web"
+
+def get_search_config(tools=None):
+    tools = tools or get_ai_tools()
+    search = tools.get("search", {})
+    if not isinstance(search, dict):
+        search = {}
+    return search
+
+def get_search_provider(search_config, provider_id=None, search_type="web"):
+    providers = search_config.get("providers", {})
+    if not isinstance(providers, dict):
+        providers = {}
+    search_type = normalize_search_type(search_type)
+    provider_id = (provider_id or "auto").strip()
+    if provider_id and provider_id != "auto":
+        provider = providers.get(provider_id)
+        if isinstance(provider, dict):
+            provider = provider.copy()
+            provider["id"] = provider_id
+            return provider
+        return None
+
+    if search_type == "lens":
+        candidates = [search_config.get("lens_provider"), search_config.get("image_provider"), search_config.get("default_provider")]
+    elif search_type == "image":
+        candidates = [search_config.get("image_provider"), search_config.get("default_provider")]
+    else:
+        candidates = [search_config.get("default_provider")]
+    candidates.extend(providers.keys())
+    for candidate in candidates:
+        provider = providers.get(candidate)
+        if not isinstance(provider, dict):
+            continue
+        if search_type not in provider.get("supports", []):
+            continue
+        provider = provider.copy()
+        provider["id"] = candidate
+        return provider
+    return None
+
+def get_provider_api_key(provider, key_name="api_key_env"):
+    env_name = provider.get(key_name)
+    if not env_name:
+        return None, None
+    return os.getenv(env_name), env_name
+
+def looks_like_url(value):
+    if not value:
+        return False
+    parsed = urllib.parse.urlparse(str(value))
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+def first_url(*values):
+    for value in values:
+        if looks_like_url(value):
+            return str(value)
+    return ""
+
+def normalize_search_result(provider_id, search_type, title="", url="", content="", thumbnail="", image_url="", source_url=""):
+    clean_url = first_url(url, source_url, image_url)
+    clean_source_url = first_url(source_url, url)
+    clean_image_url = first_url(image_url) if search_type in ("image", "lens") else ""
+    return {
+        "provider": provider_id,
+        "type": search_type,
+        "title": title or "제목 없음",
+        "url": clean_url,
+        "content": content or "",
+        "thumbnail": first_url(thumbnail),
+        "image_url": clean_image_url,
+        "source_url": clean_source_url
+    }
+
+def unwrap_duckduckgo_url(href):
+    href = html_lib.unescape(str(href or "").strip())
+    if not href:
+        return ""
+    if href.startswith("//"):
+        href = "https:" + href
+    parsed = urllib.parse.urlparse(href)
+    if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
+        query = urllib.parse.parse_qs(parsed.query)
+        target = query.get("uddg", [""])[0]
+        return urllib.parse.unquote(target) if target else href
+    return href
+
+class DuckDuckGoLiteParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self.current = None
+        self.capture = None
+        self.buffer = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = set((attrs.get("class") or "").split())
+        if tag == "a" and "result-link" in classes:
+            self._finish_current()
+            self.current = {
+                "title": "",
+                "url": unwrap_duckduckgo_url(attrs.get("href", "")),
+                "content": ""
+            }
+            self.capture = "title"
+            self.buffer = []
+        elif tag in ("td", "div") and "result-snippet" in classes and self.current:
+            self.capture = "snippet"
+            self.buffer = []
+
+    def handle_data(self, data):
+        if self.capture and data:
+            self.buffer.append(data)
+
+    def handle_endtag(self, tag):
+        if self.capture == "title" and tag == "a" and self.current is not None:
+            self.current["title"] = self._clean_buffer()
+            self.capture = None
+            self.buffer = []
+        elif self.capture == "snippet" and tag in ("td", "div") and self.current is not None:
+            self.current["content"] = self._clean_buffer()
+            self._finish_current()
+            self.capture = None
+            self.buffer = []
+
+    def close(self):
+        super().close()
+        self._finish_current()
+
+    def _clean_buffer(self):
+        text = html_lib.unescape(" ".join(self.buffer))
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _finish_current(self):
+        if not self.current:
+            return
+        if self.current.get("title") and looks_like_url(self.current.get("url")):
+            self.results.append(self.current)
+        self.current = None
+
+class SearchHTMLTextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "noscript", "svg", "canvas"):
+            self.skip_depth += 1
+        elif tag in ("p", "br", "div", "li", "h1", "h2", "h3", "article", "section"):
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript", "svg", "canvas") and self.skip_depth:
+            self.skip_depth -= 1
+        elif tag in ("p", "div", "li", "h1", "h2", "h3", "article", "section"):
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if self.skip_depth:
+            return
+        text = html_lib.unescape(data or "").strip()
+        if text:
+            self.parts.append(text)
+
+    def get_text(self):
+        text = " ".join(self.parts)
+        text = re.sub(r"[ \t\r\f\v]+", " ", text)
+        text = re.sub(r"\n\s*\n+", "\n", text)
+        return text.strip()
+
+def extract_search_page_text(data, content_type=""):
+    text = decode_text_bytes(data)
+    if "html" not in (content_type or "").lower():
+        return re.sub(r"\s+", " ", text).strip()
+    parser = SearchHTMLTextExtractor()
+    try:
+        parser.feed(text)
+        return parser.get_text()
+    except Exception:
+        text = re.sub(r"<script[\s\S]*?</script>", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        return re.sub(r"\s+", " ", html_lib.unescape(text)).strip()
+
+def is_fetchable_search_url(url):
+    if not url:
+        return False
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    lower_path = parsed.path.lower()
+    blocked_ext = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".mp4", ".webm", ".mp3", ".zip", ".7z", ".rar")
+    return not lower_path.endswith(blocked_ext)
+
+async def fetch_search_page_excerpt(session, url, max_chars=AI_SEARCH_PAGE_MAX_CHARS, max_bytes=AI_SEARCH_PAGE_MAX_BYTES):
+    if not is_fetchable_search_url(url):
+        return ""
+    try:
+        async with session.get(url, allow_redirects=True, headers={"User-Agent": "PuangBOT/AI-Search"}) as response:
+            if response.status >= 400:
+                return ""
+            content_type = response.headers.get("Content-Type", "")
+            if not any(kind in content_type.lower() for kind in ("text/", "html", "xml", "json")):
+                return ""
+            data = await response.content.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                data = data[:max_bytes]
+            text = extract_search_page_text(data, content_type)
+            return truncate_for_prompt(text, max_chars)
+    except Exception:
+        return ""
+
+def get_cached_search_page_excerpt(url, ttl_seconds):
+    if not url:
+        return ""
+    cached = AI_SEARCH_PAGE_CACHE.get(url)
+    if not cached:
+        return ""
+    created_at, excerpt = cached
+    if time.time() - created_at > ttl_seconds:
+        AI_SEARCH_PAGE_CACHE.pop(url, None)
+        return ""
+    return excerpt
+
+def set_cached_search_page_excerpt(url, excerpt):
+    if url and excerpt:
+        AI_SEARCH_PAGE_CACHE[url] = (time.time(), excerpt)
+
+async def enhance_search_results_with_pages(results, search_config, force=False):
+    if not results:
+        return results
+    if not force and not search_config.get("fetch_pages", False):
+        return results
+    fetch_limit = max(0, min(int(search_config.get("fetch_page_limit") or AI_SEARCH_PAGE_FETCH_LIMIT), 5))
+    if fetch_limit <= 0:
+        return results
+    page_max_chars = max(500, min(int(search_config.get("page_max_chars") or AI_SEARCH_PAGE_MAX_CHARS), 6000))
+    cache_enabled = bool(search_config.get("cache_enabled", True))
+    cache_ttl = max(60, int(search_config.get("cache_ttl_seconds") or AI_SEARCH_CACHE_TTL_SECONDS))
+    timeout = aiohttp.ClientTimeout(total=max(5, int(search_config.get("timeout") or 15)))
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        fetched = 0
+        for item in results:
+            if fetched >= fetch_limit:
+                break
+            if item.get("type") in ("image", "video", "lens"):
+                continue
+            url = item.get("source_url") or item.get("url")
+            excerpt = get_cached_search_page_excerpt(url, cache_ttl) if cache_enabled else ""
+            if not excerpt:
+                excerpt = await fetch_search_page_excerpt(session, url, page_max_chars)
+                if cache_enabled:
+                    set_cached_search_page_excerpt(url, excerpt)
+            if excerpt:
+                item["page_excerpt"] = excerpt
+                fetched += 1
+    return results
+
+async def run_searxng_provider_search(query, provider, search_type, max_results, image_url=None):
+    base_url = (provider.get("base_url") or "http://127.0.0.1:8080").rstrip("/")
+    timeout = aiohttp.ClientTimeout(total=max(5, int(provider.get("timeout") or 15)))
     params = {"q": query, "format": "json", "language": "ko-KR"}
+    category_map = {
+        "web": "general",
+        "news": "news",
+        "image": "images",
+        "video": "videos"
+    }
+    if search_type in category_map:
+        params["categories"] = category_map[search_type]
     urls = [f"{base_url}/search", base_url]
     last_error = None
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -981,49 +1390,288 @@ async def run_searxng_search(query, web_config):
                     for item in data.get("results", [])[:max_results]:
                         if not isinstance(item, dict):
                             continue
-                        results.append({
-                            "title": item.get("title") or "제목 없음",
-                            "url": item.get("url") or "",
-                            "content": item.get("content") or item.get("snippet") or ""
-                        })
+                        results.append(normalize_search_result(
+                            provider.get("id", "searxng-local"),
+                            search_type,
+                            title=item.get("title"),
+                            url=item.get("url"),
+                            content=item.get("content") or item.get("snippet"),
+                            thumbnail=item.get("thumbnail") or item.get("thumbnail_src"),
+                            image_url=item.get("img_src") or item.get("image_src") or item.get("url"),
+                            source_url=item.get("source") or item.get("url")
+                        ))
                     return results, None
             except Exception as error:
                 last_error = str(error)
     return [], f"SearXNG 검색 실패: {last_error}"
 
-def format_web_search_context(query, results):
+async def run_duckduckgo_lite_provider_search(query, provider, search_type, max_results, image_url=None):
+    if search_type not in ("web", "news"):
+        return [], f"DuckDuckGo Lite provider는 `{search_type}` 검색을 지원하지 않습니다."
+    base_url = provider.get("base_url") or "https://lite.duckduckgo.com/lite/"
+    timeout = aiohttp.ClientTimeout(total=max(5, int(provider.get("timeout") or 15)))
+    search_query = query if search_type == "web" else f"{query} 뉴스"
+    params = {"q": search_query}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.7,en;q=0.6",
+        "Accept-Encoding": "gzip, deflate"
+    }
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(base_url, params=params) as response:
+            body = await response.text()
+            if response.status >= 400:
+                return [], f"DuckDuckGo Lite 검색 실패 {response.status}: {body[:200]}"
+
+    parser = DuckDuckGoLiteParser()
+    try:
+        parser.feed(body)
+        parser.close()
+    except Exception as error:
+        return [], f"DuckDuckGo Lite 검색 결과 파싱 실패: {error}"
+
+    results = []
+    for item in parser.results[:max_results]:
+        results.append(normalize_search_result(
+            provider.get("id", "duckduckgo-lite"),
+            search_type,
+            title=item.get("title"),
+            url=item.get("url"),
+            content=item.get("content"),
+            source_url=item.get("url")
+        ))
+    return results, None
+
+async def run_brave_provider_search(query, provider, search_type, max_results, image_url=None):
+    api_key, env_name = get_provider_api_key(provider)
+    if not api_key:
+        return [], f"Brave API 키 환경 변수 `{env_name}`가 없습니다."
+    endpoint_map = {
+        "web": "web/search",
+        "news": "news/search",
+        "image": "images/search",
+        "video": "videos/search"
+    }
+    endpoint = endpoint_map.get(search_type)
+    if not endpoint:
+        return [], f"Brave provider는 `{search_type}` 검색을 지원하지 않습니다."
+    url = f"https://api.search.brave.com/res/v1/{endpoint}"
+    timeout = aiohttp.ClientTimeout(total=max(5, int(provider.get("timeout") or 15)))
+    params = {"q": query, "count": max_results, "country": "KR", "search_lang": "ko"}
+    headers = {"X-Subscription-Token": api_key, "Accept": "application/json"}
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, params=params, headers=headers) as response:
+            body = await response.text()
+            if response.status >= 400:
+                return [], f"Brave 검색 실패 {response.status}: {body[:200]}"
+            data = json.loads(body)
+    raw_results = []
+    for key in ("web", "news", "images", "videos"):
+        section = data.get(key)
+        if isinstance(section, dict) and isinstance(section.get("results"), list):
+            raw_results = section["results"]
+            break
+    if not raw_results and isinstance(data.get("results"), list):
+        raw_results = data["results"]
+    results = []
+    for item in raw_results[:max_results]:
+        results.append(normalize_search_result(
+            provider.get("id", "brave-api"),
+            search_type,
+            title=item.get("title"),
+            url=item.get("url"),
+            content=item.get("description") or item.get("snippet"),
+            thumbnail=(item.get("thumbnail") or {}).get("src") if isinstance(item.get("thumbnail"), dict) else item.get("thumbnail"),
+            image_url=item.get("image_url") or item.get("url"),
+            source_url=item.get("url")
+        ))
+    return results, None
+
+async def run_google_cse_provider_search(query, provider, search_type, max_results, image_url=None):
+    api_key, key_env = get_provider_api_key(provider)
+    cx = os.getenv(provider.get("cx_env", ""))
+    if not api_key:
+        return [], f"Google CSE API 키 환경 변수 `{key_env}`가 없습니다."
+    if not cx:
+        return [], f"Google CSE 검색 엔진 ID 환경 변수 `{provider.get('cx_env')}`가 없습니다."
+    if search_type not in ("web", "image"):
+        return [], f"Google CSE provider는 `{search_type}` 검색을 지원하지 않습니다."
+    timeout = aiohttp.ClientTimeout(total=max(5, int(provider.get("timeout") or 15)))
+    params = {"key": api_key, "cx": cx, "q": query, "num": max(1, min(max_results, 10))}
+    if search_type == "image":
+        params["searchType"] = "image"
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get("https://www.googleapis.com/customsearch/v1", params=params) as response:
+            body = await response.text()
+            if response.status >= 400:
+                return [], f"Google CSE 검색 실패 {response.status}: {body[:200]}"
+            data = json.loads(body)
+    results = []
+    for item in data.get("items", [])[:max_results]:
+        image_info = item.get("image") if isinstance(item.get("image"), dict) else {}
+        results.append(normalize_search_result(
+            provider.get("id", "google-cse"),
+            search_type,
+            title=item.get("title"),
+            url=item.get("link"),
+            content=item.get("snippet"),
+            thumbnail=image_info.get("thumbnailLink"),
+            image_url=item.get("link") if search_type == "image" else "",
+            source_url=image_info.get("contextLink") or item.get("link")
+        ))
+    return results, None
+
+async def run_serpapi_lens_provider_search(query, provider, search_type, max_results, image_url=None):
+    api_key, env_name = get_provider_api_key(provider)
+    if not api_key:
+        return [], f"SerpAPI 키 환경 변수 `{env_name}`가 없습니다."
+    if not image_url:
+        return [], "Lens 검색에는 공개 접근 가능한 이미지 URL이 필요합니다."
+    timeout = aiohttp.ClientTimeout(total=max(5, int(provider.get("timeout") or 20)))
+    params = {
+        "engine": "google_lens",
+        "url": image_url,
+        "api_key": api_key,
+        "hl": "ko",
+        "country": "kr"
+    }
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get("https://serpapi.com/search.json", params=params) as response:
+            body = await response.text()
+            if response.status >= 400:
+                return [], f"SerpAPI Lens 검색 실패 {response.status}: {body[:200]}"
+            data = json.loads(body)
+    raw_results = data.get("visual_matches") or data.get("image_results") or data.get("organic_results") or []
+    results = []
+    for item in raw_results[:max_results]:
+        results.append(normalize_search_result(
+            provider.get("id", "serpapi-lens"),
+            "lens",
+            title=item.get("title"),
+            url=item.get("link") or item.get("source"),
+            content=item.get("snippet") or item.get("source"),
+            thumbnail=item.get("thumbnail"),
+            image_url=item.get("image") or item.get("thumbnail"),
+            source_url=item.get("link") or item.get("source")
+        ))
+    return results, None
+
+async def run_search(query, search_type="web", provider_id="auto", image_url=None, fetch_pages=None):
+    tools = get_ai_tools()
+    search_config = get_search_config(tools)
+    legacy_web = tools.get("web_search", {})
+    search_type = normalize_search_type(search_type)
+    if not search_config.get("enabled", False):
+        return [], "검색 도구가 꺼져 있습니다. `/ai검색설정`으로 켤 수 있습니다."
+    provider = get_search_provider(search_config, provider_id, search_type)
+    if not provider:
+        return [], f"`{search_type}` 검색을 지원하는 provider를 찾지 못했습니다."
+    if search_type not in provider.get("supports", []):
+        return [], f"`{provider.get('id')}` provider는 `{search_type}` 검색을 지원하지 않습니다."
+    if not provider.get("enabled", False):
+        return [], f"`{provider.get('id')}` provider가 꺼져 있습니다."
+    max_results = max(1, min(int(search_config.get("max_results") or legacy_web.get("max_results") or AI_WEB_SEARCH_MAX_RESULTS), 10))
+    provider_type = provider.get("type")
+    results = []
+    error = None
+    if provider_type == "searxng":
+        results, error = await run_searxng_provider_search(query, provider, search_type, max_results, image_url=image_url)
+    elif provider_type == "duckduckgo_lite":
+        results, error = await run_duckduckgo_lite_provider_search(query, provider, search_type, max_results, image_url=image_url)
+    elif provider_type == "brave":
+        results, error = await run_brave_provider_search(query, provider, search_type, max_results, image_url=image_url)
+    elif provider_type == "google_cse":
+        results, error = await run_google_cse_provider_search(query, provider, search_type, max_results, image_url=image_url)
+    elif provider_type == "serpapi_lens":
+        results, error = await run_serpapi_lens_provider_search(query, provider, search_type, max_results, image_url=image_url)
+    else:
+        return [], f"지원하지 않는 검색 provider 형식입니다: {provider_type}"
+    if error or not results:
+        return results, error
+    force_fetch = bool(fetch_pages) if fetch_pages is not None else False
+    results = await enhance_search_results_with_pages(results, search_config, force=force_fetch)
+    return results, None
+
+async def run_searxng_search(query, web_config):
+    tools = get_ai_tools()
+    search_config = get_search_config(tools)
+    if "search" not in tools:
+        search_config["enabled"] = bool(web_config.get("enabled", False))
+    return await run_search(query, "web", provider_id="searxng-local")
+
+def format_search_context(query, results, search_type="web", max_chars=10000):
     if not results:
         return ""
-    lines = [f"[웹 검색 결과: {query}]"]
+    search_type = normalize_search_type(search_type)
+    type_label = {
+        "web": "웹",
+        "news": "뉴스",
+        "image": "이미지",
+        "video": "영상",
+        "lens": "이미지/Lens"
+    }.get(search_type, "웹")
+    provider_names = ", ".join(sorted({item.get("provider", "unknown") for item in results}))
+    lines = [f"[{type_label} 검색 결과: {query}]", f"Provider: {provider_names}"]
     for index, item in enumerate(results, 1):
         title = item.get("title") or "제목 없음"
         url = item.get("url") or ""
         content = (item.get("content") or "").replace("\n", " ").strip()
-        lines.append(f"{index}. {title}\nURL: {url}\n요약: {truncate_for_prompt(content, 600)}")
+        detail = [f"{index}. {title}", f"URL: {url}"]
+        if item.get("source_url") and item.get("source_url") != url:
+            detail.append(f"원본/출처: {item.get('source_url')}")
+        if item.get("image_url"):
+            detail.append(f"이미지: {item.get('image_url')}")
+        if item.get("thumbnail"):
+            detail.append(f"썸네일: {item.get('thumbnail')}")
+        detail.append(f"요약: {truncate_for_prompt(content, 600)}")
+        if item.get("page_excerpt"):
+            detail.append(f"본문 발췌: {truncate_for_prompt(item.get('page_excerpt'), AI_SEARCH_PAGE_MAX_CHARS)}")
+        lines.append("\n".join(detail))
     lines.append("답변에는 필요한 경우 위 URL을 출처로 함께 표시하세요.")
-    return truncate_for_prompt("\n\n".join(lines), 10000)
+    return truncate_for_prompt("\n\n".join(lines), max_chars)
+
+def format_web_search_context(query, results):
+    return format_search_context(query, results, "web")
 
 async def build_ai_tool_context(message, config, base_content):
     tools = get_ai_tools()
     history_config = tools.get("channel_history", {})
-    web_config = tools.get("web_search", {})
+    search_config = get_search_config(tools)
     directive, directive_text = parse_ai_tool_directive(base_content)
-    user_text = directive_text if directive in ("web", "history") and directive_text else base_content
+    search_directives = {"web", "news", "image", "video", "lens"}
+    user_text = directive_text if directive in search_directives.union({"history"}) and directive_text else base_content
     context_blocks = []
     notes = []
     used_tools = set()
 
-    if directive == "web" or (directive is None and should_auto_web_search(base_content, web_config)):
+    search_type = None
+    if directive in search_directives:
+        search_type = directive
+    elif directive is None and should_auto_web_search(base_content, search_config):
+        search_type = infer_search_type(base_content, bool(message.attachments))
+
+    if search_type:
         query = directive_text or base_content
-        results, error = await run_searxng_search(query, web_config)
+        image_url = get_first_image_attachment_url(message.attachments) if search_type == "lens" else None
+        if search_type == "lens" and not image_url:
+            notes.append("Lens 검색에는 이미지 첨부가 필요합니다. 이미지 없이 검색할 때는 `이미지검색`을 사용하세요.")
+            results, error = [], None
+        else:
+            results, error = await run_search(query, search_type, image_url=image_url)
         if error:
             notes.append(error)
         else:
-            context = format_web_search_context(query, results)
+            context = format_search_context(
+                query,
+                results,
+                search_type,
+                int(search_config.get("context_max_chars") or AI_SEARCH_CONTEXT_MAX_CHARS)
+            )
             if context:
                 context_blocks.append(context)
                 used_tools.add("web")
-            notes.append(f"웹 검색 결과 {len(results)}개를 참고했습니다.")
+            notes.append(f"{search_type} 검색 결과 {len(results)}개를 참고했습니다.")
 
     if directive == "history" or (directive is None and should_auto_history_search(base_content, history_config)):
         query = directive_text or base_content
@@ -1066,10 +1714,10 @@ async def maybe_retry_ai_with_self_search(
     used_tools
 ):
     tools = get_ai_tools()
-    web_config = tools.get("web_search", {})
+    search_config = get_search_config(tools)
     if "web" in used_tools:
         return None, None, None
-    if not web_config.get("enabled", False) or not web_config.get("search_on_uncertain", True):
+    if not search_config.get("enabled", False) or not search_config.get("search_on_uncertain", True):
         return None, None, None
     if not is_ai_answer_uncertain(answer):
         return None, None, None
@@ -1078,11 +1726,23 @@ async def maybe_retry_ai_with_self_search(
     if not query:
         return None, None, None
 
-    results, error = await run_searxng_search(query, web_config)
+    inferred_type = infer_search_type(query, bool(image_payloads))
+    if inferred_type == "lens":
+        inferred_type = "image"
+    results, error = await run_search(
+        query,
+        inferred_type,
+        fetch_pages=bool(search_config.get("fetch_pages_on_uncertain", True))
+    )
     if error or not results:
         return None, None, error or "검색 결과가 없습니다."
 
-    search_context = format_web_search_context(query, results)
+    search_context = format_search_context(
+        query,
+        results,
+        inferred_type,
+        int(search_config.get("context_max_chars") or AI_SEARCH_CONTEXT_MAX_CHARS)
+    )
     retry_prompt = (
         f"{search_context}\n\n"
         "[이전 답변]\n"
@@ -1101,8 +1761,8 @@ async def maybe_retry_ai_with_self_search(
         memory_content,
         has_documents=has_documents
     )
-    retry_route = f"{retry_route} / 모르는 지식 자동 웹검색"
-    return retry_answer, retry_route, f"모르는 지식으로 판단해 웹 검색 결과 {len(results)}개를 추가 참고했습니다."
+    retry_route = f"{retry_route} / 모르는 지식 자동 {inferred_type} 검색"
+    return retry_answer, retry_route, f"모르는 지식으로 판단해 {inferred_type} 검색 결과 {len(results)}개를 추가 참고했습니다."
 
 def strip_bot_mention(content):
     if not bot.user:
@@ -1169,13 +1829,24 @@ def extract_pdf_text(data):
         except Exception:
             return "PDF 텍스트 추출 라이브러리(pypdf 또는 PyPDF2)가 없어 본문을 읽지 못했습니다."
 
-    reader = reader_cls(io.BytesIO(data))
-    pages = []
-    for index, page in enumerate(reader.pages):
-        if index >= 8:
-            break
-        pages.append(page.extract_text() or "")
-    return "\n".join(pages).strip() or "PDF에서 추출 가능한 텍스트를 찾지 못했습니다."
+    try:
+        reader = reader_cls(io.BytesIO(data))
+        if getattr(reader, "is_encrypted", False):
+            try:
+                reader.decrypt("")
+            except Exception:
+                return "암호화된 PDF라 본문을 읽지 못했습니다."
+        pages = []
+        for index, page in enumerate(reader.pages):
+            if index >= 8:
+                break
+            try:
+                pages.append(page.extract_text() or "")
+            except Exception as page_error:
+                pages.append(f"[{index + 1}페이지 추출 실패: {page_error}]")
+        return "\n".join(pages).strip() or "PDF에서 추출 가능한 텍스트를 찾지 못했습니다. 스캔 PDF라면 OCR 처리가 필요합니다."
+    except Exception as error:
+        return f"PDF 본문 추출 실패: {error}"
 
 def try_ocr_image(data, filename):
     info = [f"이미지 파일명: {filename}"]
@@ -1238,7 +1909,10 @@ async def process_ai_attachments(attachments):
             except Exception as e:
                 notes.append(f"{filename}: DOCX 추출 실패 ({e})")
         elif ext == ".pdf":
-            text_blocks.append(f"[PDF 문서: {filename}]\n{truncate_for_prompt(extract_pdf_text(data))}")
+            try:
+                text_blocks.append(f"[PDF 문서: {filename}]\n{truncate_for_prompt(extract_pdf_text(data))}")
+            except Exception as e:
+                notes.append(f"{filename}: PDF 추출 실패 ({e})")
         else:
             notes.append(f"{filename}: 지원하지 않는 첨부 형식입니다.")
 
@@ -1678,11 +2352,9 @@ FFMPEG_PATH = os.path.abspath("ffmpeg.exe" if platform.system() == "Windows" els
 # [설정] 봇 기본 설정
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
+COMMANDS_SYNCED = False
 
 OWNER_ID = 495511094434201600  # ⚠️ 오너 ID 유지됨
-
-# [설정] server.properties에 적었던 비밀번호
-RCON_PASSWORD = "puang6974"
 
 # 🌟 경험치 데이터 저장용 파일 이름
 XP_FILE = "puang_xp.json"
@@ -1694,14 +2366,75 @@ XP_FILE = "puang_xp.json"
 # .. 를 통해 Desktop\ET 폴더로 이동합니다.
 BASE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-# 🌟 중요: 스크린샷에 맞춰 'serve'를 'server'로 수정했습니다!
-MC_ROOT_DIR = os.path.join(BASE_PATH, "server", "mc")  # Desktop\ET\server\mc
-PLAYIT_DIR = os.path.join(BASE_PATH, "server")        # Desktop\ET\server
-PLAYIT_LINK = "playit.gg.lnk"                         # 바로가기 파일명
+def get_default_server_settings():
+    return {
+        "minecraft": {
+            "rcon_host": "127.0.0.1",
+            "rcon_port": 25575,
+            "rcon_password_env": "PUANG_RCON_PASSWORD",
+            "mc_root_dir": "server/mc",
+            "playit_dir": "server",
+            "playit_link": "playit.gg.lnk"
+        },
+        "startup": {
+            "auto_setup_ffmpeg": True,
+            "auto_setup_edge_tts": False,
+            "auto_start_searxng": True
+        }
+    }
+
+def load_server_settings():
+    data = load_json_file(SERVER_SETTINGS_FILE, None)
+    defaults = get_default_server_settings()
+    if not isinstance(data, dict):
+        return defaults
+    result = copy.deepcopy(defaults)
+    for section, values in data.items():
+        if isinstance(values, dict) and isinstance(result.get(section), dict):
+            result[section].update(values)
+        else:
+            result[section] = values
+    return result
+
+def resolve_server_path(value, fallback):
+    path = os.path.expandvars(os.path.expanduser(str(value or ""))).strip()
+    if not path:
+        return fallback
+    if os.path.isabs(path):
+        return os.path.abspath(path)
+    return os.path.abspath(os.path.join(BASE_PATH, path))
+
+def get_minecraft_settings():
+    return load_server_settings().get("minecraft", {})
+
+def get_rcon_config():
+    settings = get_minecraft_settings()
+    password_env = settings.get("rcon_password_env") or "PUANG_RCON_PASSWORD"
+    password = os.getenv(password_env) or settings.get("rcon_password") or ""
+    return {
+        "host": settings.get("rcon_host") or "127.0.0.1",
+        "port": int(settings.get("rcon_port") or 25575),
+        "password_env": password_env,
+        "password": password
+    }
+
+def open_rcon():
+    config = get_rcon_config()
+    if not config["password"]:
+        raise RuntimeError(f"RCON 비밀번호가 설정되지 않았습니다. 환경 변수 `{config['password_env']}` 또는 `{SERVER_SETTINGS_FILE}`을 설정하세요.")
+    return MCRcon(config["host"], config["password"], port=config["port"])
+
+# 🌟 중요: 서버 경로는 server_settings.json에서 바꿀 수 있습니다.
+server_settings = get_minecraft_settings()
+MC_ROOT_DIR = resolve_server_path(server_settings.get("mc_root_dir"), os.path.join(BASE_PATH, "server", "mc"))
+PLAYIT_DIR = resolve_server_path(server_settings.get("playit_dir"), os.path.join(BASE_PATH, "server"))
+PLAYIT_LINK = server_settings.get("playit_link") or "playit.gg.lnk"
 
 # [디버깅용] 봇이 켜질 때 실제 경로를 콘솔에 출력해서 확인하게 합니다.
 print(f"📂 [경로 확인] 마크 루트: {MC_ROOT_DIR}")
 print(f"📂 [경로 확인] Playit 폴더: {PLAYIT_DIR}")
+if not get_rcon_config()["password"]:
+    print(f"⚠️ [RCON] 비밀번호가 없습니다. {SERVER_SETTINGS_FILE} 또는 PUANG_RCON_PASSWORD 환경 변수를 설정해야 RCON 명령이 동작합니다.")
 
 FFMPEG_FILTERS = {
     'normal': '',
@@ -1723,12 +2456,13 @@ def can_manage_ai_settings(member):
     return member.id == OWNER_ID or member.guild_permissions.manage_guild
 
 class Song:
-    def __init__(self, url, title, duration, thumbnail, requester):
+    def __init__(self, url, title, duration, thumbnail, requester, page_url=None):
         self.url = url
         self.title = title
         self.duration = duration
         self.thumbnail = thumbnail
         self.requester = requester
+        self.page_url = page_url or url
 
 class GuildState:
     def __init__(self):
@@ -1742,6 +2476,7 @@ class GuildState:
         self.voice_client = None
         self.music_source = None
         self.mixer = None
+        self.playback_lock = asyncio.Lock()
         self.filter = 'normal'   
         self.start_time = 0      
         self.controller_msg = None 
@@ -1759,8 +2494,9 @@ class GuildState:
 guild_states = {}
 
 class MixedAudioSource(discord.AudioSource):
-    def __init__(self, state):
+    def __init__(self, state, music_source=None):
         self.state = state
+        self.music_source = music_source
         self.active_tts = None
         self.closed = False
         self.music_multiplier = 1.0
@@ -1810,7 +2546,7 @@ class MixedAudioSource(discord.AudioSource):
         return self.music_multiplier
 
     def _read_music_frame(self):
-        source = self.state.music_source
+        source = self.music_source
         if source is None:
             return b""
 
@@ -1836,13 +2572,16 @@ class MixedAudioSource(discord.AudioSource):
             self._cleanup_active_tts()
 
     def _cleanup_music(self):
-        if self.state.music_source is None:
+        source = self.music_source
+        if source is None:
             return
         try:
-            self.state.music_source.cleanup()
+            source.cleanup()
         except Exception:
             pass
-        self.state.music_source = None
+        if self.state.music_source is source:
+            self.state.music_source = None
+        self.music_source = None
 
     def _cleanup_active_tts(self):
         if self.active_tts is None:
@@ -1860,7 +2599,19 @@ class MixedAudioSource(discord.AudioSource):
         except Exception:
             pass
 
-def start_mixer_if_needed(guild_id, interaction_channel=None):
+def is_voice_stream_active(state):
+    voice = state.voice_client
+    return bool(voice and (voice.is_playing() or voice.is_paused()))
+
+def can_start_music_now(state):
+    return not state.current_song and not state.mixer and not is_voice_stream_active(state)
+
+def get_active_music_source(state):
+    if state.mixer and getattr(state.mixer, "music_source", None) is not None:
+        return state.mixer.music_source
+    return state.music_source
+
+def start_mixer_if_needed(guild_id, interaction_channel=None, music_source=None):
     state = get_state(guild_id)
     voice = state.voice_client
     if not voice or not voice.is_connected():
@@ -1870,9 +2621,12 @@ def start_mixer_if_needed(guild_id, interaction_channel=None):
         state.playback_channel = interaction_channel
 
     if voice.is_playing() or voice.is_paused():
+        if music_source is not None:
+            return False
         return True
 
-    state.mixer = MixedAudioSource(state)
+    state.mixer = MixedAudioSource(state, music_source)
+    state.music_source = music_source
 
     def after_mixer(error):
         if error:
@@ -1881,15 +2635,30 @@ def start_mixer_if_needed(guild_id, interaction_channel=None):
 
         if state.current_song or state.queue:
             channel = interaction_channel or state.playback_channel
-            coro = play_next(guild_id, channel)
-            fut = asyncio.run_coroutine_threadsafe(coro, bot.loop)
-            try:
-                fut.result()
-            except Exception as e:
-                print(f"다음 곡 재생 오류: {e}")
+            coro = continue_playback_after_mixer(guild_id, channel)
+            asyncio.run_coroutine_threadsafe(coro, bot.loop)
 
     voice.play(state.mixer, after=after_mixer)
     return True
+
+async def continue_playback_after_mixer(guild_id, interaction_channel):
+    state = get_state(guild_id)
+    voice = state.voice_client
+    for _ in range(30):
+        if not voice or not voice.is_connected():
+            return
+        if not voice.is_playing() and not voice.is_paused():
+            break
+        await asyncio.sleep(0.1)
+    if voice and (voice.is_playing() or voice.is_paused()):
+        print("다음 곡 재생 대기 실패: 이전 mixer가 아직 재생 중으로 표시됩니다.")
+        return
+
+    try:
+        if state.current_song or state.queue:
+            await play_next(guild_id, interaction_channel)
+    except Exception as e:
+        print(f"다음 곡 재생 오류: {e}")
 
 def load_xp():
     try:
@@ -2191,6 +2960,103 @@ def can_skip_immediately(user, state):
         or (requester is not None and user.id == requester.id)
     )
 
+async def play_next(guild_id, interaction_channel):
+    state = get_state(guild_id)
+    async with state.playback_lock:
+        await play_next_locked(guild_id, interaction_channel)
+
+async def play_next_locked(guild_id, interaction_channel):
+    state = get_state(guild_id)
+    if interaction_channel is not None:
+        state.playback_channel = interaction_channel
+
+    while True:
+        voice = state.voice_client
+        if not voice or not voice.is_connected():
+            state.is_playing = False
+            state.current_song = None
+            state.music_source = None
+            return
+
+        if is_voice_stream_active(state):
+            return
+
+        if state.current_song and state.loop_mode == 1:
+            state.queue.insert(0, state.current_song)
+        elif state.current_song and state.loop_mode == 2:
+            state.queue.append(state.current_song)
+
+        if not state.queue:
+            state.is_playing = False
+            state.current_song = None
+            state.music_source = None
+            if state.controller_msg:
+                try:
+                    await state.controller_msg.edit(embed=build_now_playing_embed(state), view=MusicController(guild_id))
+                except Exception:
+                    state.controller_msg = None
+            elif interaction_channel is not None:
+                await interaction_channel.send(embed=discord.Embed(description="🎶 모든 노래가 끝났어요!", color=discord.Color.dark_gray()))
+            return
+
+        song = state.queue.pop(0)
+        state.current_song = song
+        state.skip_votes.clear()
+        state.is_playing = True
+        state.start_time = time.time()
+
+        filter_str = FFMPEG_FILTERS.get(state.filter, '')
+        ffmpeg_opts = {
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+            'options': f'-vn -filter:a "{filter_str}"' if filter_str else '-vn'
+        }
+
+        music_source = None
+        try:
+            await refresh_song_stream_url(song)
+            raw_source = discord.FFmpegPCMAudio(song.url, executable=FFMPEG_PATH, **ffmpeg_opts)
+            music_source = discord.PCMVolumeTransformer(raw_source, volume=state.volume)
+
+            if not start_mixer_if_needed(guild_id, interaction_channel, music_source=music_source):
+                try:
+                    music_source.cleanup()
+                except Exception:
+                    pass
+                state.queue.insert(0, song)
+                state.current_song = None
+                state.is_playing = False
+                state.music_source = None
+                return
+
+            embed = build_now_playing_embed(state)
+            view = MusicController(guild_id)
+
+            if state.controller_msg:
+                try:
+                    await state.controller_msg.edit(embed=embed, view=view)
+                    return
+                except Exception:
+                    state.controller_msg = None
+
+            if interaction_channel is not None:
+                state.controller_msg = await interaction_channel.send(embed=embed, view=view)
+            return
+
+        except Exception as e:
+            if music_source is not None:
+                try:
+                    music_source.cleanup()
+                except Exception:
+                    pass
+            state.current_song = None
+            state.is_playing = False
+            state.music_source = None
+            print(f"재생 오류: {e}")
+            if not state.queue:
+                if interaction_channel is not None:
+                    await interaction_channel.send("⚠️ 노래를 재생할 수 없어 대기열을 중단했어요.")
+                return
+
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member == bot.user and before.channel and not after.channel:
@@ -2389,6 +3255,7 @@ class MusicController(discord.ui.View):
             requester = getattr(state.current_song, "requester", None)
             reason = "신청자 권한" if requester and user.id == requester.id else "DJ 권한"
             state.current_song = None
+            state.is_playing = False
             vc.stop()
             await interaction.response.send_message(f"⏭️ **{reason}으로 즉시 스킵했습니다!**", ephemeral=True)
             if not state.queue:
@@ -2401,6 +3268,7 @@ class MusicController(discord.ui.View):
 
         if len(state.skip_votes) >= required_votes:
             state.current_song = None
+            state.is_playing = False
             vc.stop()
             await interaction.response.send_message(f"⏭️ **투표 가결 ({len(state.skip_votes)}/{required_votes})!** 스킵합니다.", ephemeral=True)
             if not state.queue:
@@ -2414,6 +3282,7 @@ class MusicController(discord.ui.View):
         state = get_state(self.guild_id)
         state.queue.clear()
         state.current_song = None
+        state.is_playing = False
         state.music_source = None
         state.loop_mode = 0
         state.skip_votes.clear()
@@ -2467,71 +3336,14 @@ class MusicController(discord.ui.View):
         state.queue_page = 0
         await self._edit_panel(interaction)
 
-async def play_next(guild_id, interaction_channel):
-    state = get_state(guild_id)
-    voice = state.voice_client
-    if interaction_channel is not None:
-        state.playback_channel = interaction_channel
-
-    if state.current_song and state.loop_mode == 1:
-        state.queue.insert(0, state.current_song)
-    elif state.current_song and state.loop_mode == 2:
-        state.queue.append(state.current_song)
-
-    if not state.queue:
-        state.is_playing = False
-        state.current_song = None
-        if state.controller_msg:
-            try:
-                await state.controller_msg.edit(embed=build_now_playing_embed(state), view=MusicController(guild_id))
-            except Exception:
-                state.controller_msg = None
-        elif interaction_channel is not None:
-            await interaction_channel.send(embed=discord.Embed(description="🎵 모든 노래가 끝났어요!", color=discord.Color.dark_gray()))
-        return
-
-    song = state.queue.pop(0)
-    state.current_song = song
-    state.skip_votes.clear()  # 새 노래가 시작되면 투표 초기화
-    state.is_playing = True
-    state.start_time = time.time()
-
-    filter_str = FFMPEG_FILTERS.get(state.filter, '')
-    ffmpeg_opts = {
-        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-        'options': f'-vn -filter:a "{filter_str}"' if filter_str else '-vn'
-    }
-
-    try:
-        # 🌟 이제 절대 경로를 사용하여 ffmpeg를 무조건 찾아냅니다.
-        source = discord.FFmpegPCMAudio(song.url, executable=FFMPEG_PATH, **ffmpeg_opts)
-        state.music_source = discord.PCMVolumeTransformer(source, volume=state.volume)
-        if not start_mixer_if_needed(guild_id, interaction_channel):
-            if interaction_channel is not None:
-                await interaction_channel.send("❌ 음성 채널 연결이 끊겨 재생할 수 없어요.")
-            return
-
-        embed = build_now_playing_embed(state)
-        view = MusicController(guild_id)
-
-        if state.controller_msg:
-            try:
-                await state.controller_msg.edit(embed=embed, view=view)
-                return
-            except Exception:
-                state.controller_msg = None
-
-        if interaction_channel is not None:
-            state.controller_msg = await interaction_channel.send(embed=embed, view=view)
-
-    except Exception as e:
-        print(f"재생 오류: {e}")
-        await play_next(guild_id, interaction_channel)
-
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
-    voice_xp_loop.start() # 봇이 켜지면 음성 채널 경험치 지급 루프 시작
+    global COMMANDS_SYNCED
+    if not COMMANDS_SYNCED:
+        await bot.tree.sync()
+        COMMANDS_SYNCED = True
+    if not voice_xp_loop.is_running():
+        voice_xp_loop.start() # 봇이 켜지면 음성 채널 경험치 지급 루프 시작
     await bot.change_presence(status=discord.Status.online, activity=discord.Game("🎵 서버 무중단 운영 중"))
     print(f'✅ 푸앙봇 V4.0 로그인 완료! 푸앙푸앙: {bot.user}')
 
@@ -2915,7 +3727,7 @@ def build_server_status_embed():
     embed.add_field(name="Playit 바로가기", value="있음" if os.path.exists(playit_path) else f"없음\n`{playit_path}`", inline=False)
 
     try:
-        with MCRcon("127.0.0.1", RCON_PASSWORD, port=25575) as mcr:
+        with open_rcon() as mcr:
             response = mcr.command("list")
         embed.add_field(name="RCON", value=f"연결됨\n`{truncate_text(response, 180)}`", inline=False)
     except Exception as e:
@@ -3015,7 +3827,7 @@ async def stop_server(interaction: discord.Interaction):
             view=None
         )
         try:
-            with MCRcon("127.0.0.1", RCON_PASSWORD, port=25575) as mcr:
+            with open_rcon() as mcr:
                 mcr.command("say [푸앙봇] 5초 뒤 서버가 종료됩니다! 데이터가 저장됩니다.")
                 await asyncio.sleep(5)
                 mcr.command("stop")
@@ -3412,7 +4224,8 @@ async def ai_tools_status(interaction: discord.Interaction, 채널: discord.Text
     target_channel = 채널 or interaction.channel
     tools = get_ai_tools()
     history_config = tools.get("channel_history", {})
-    web_config = tools.get("web_search", {})
+    search_config = get_search_config(tools)
+    providers = search_config.get("providers", {})
     indexed_count, state = count_indexed_channel_history(interaction.guild_id, target_channel.id)
     embed = discord.Embed(title="🧰 AI 도구 상태", color=discord.Color.blurple())
     embed.add_field(
@@ -3434,21 +4247,65 @@ async def ai_tools_status(interaction: discord.Interaction, 채널: discord.Text
     embed.add_field(
         name="웹 검색",
         value=(
-            f"사용: `{web_config.get('enabled', False)}`\n"
-            f"자동검색: `{web_config.get('auto_search', False)}`\n"
-            f"모를 때 검색: `{web_config.get('search_on_uncertain', True)}`\n"
-            f"Provider: `{web_config.get('provider', 'searxng')}`\n"
-            f"URL: `{web_config.get('base_url', 'http://127.0.0.1:8080')}`"
+            f"사용: `{search_config.get('enabled', False)}`\n"
+            f"자동검색: `{search_config.get('auto_search', False)}`\n"
+            f"모를 때 검색: `{search_config.get('search_on_uncertain', True)}`\n"
+            f"기본 상세검색: `{search_config.get('fetch_pages', False)}`\n"
+            f"모를 때 상세검색: `{search_config.get('fetch_pages_on_uncertain', True)}`\n"
+            f"기본 Provider: `{search_config.get('default_provider', 'searxng-local')}`\n"
+            f"이미지 Provider: `{search_config.get('image_provider', 'searxng-local')}`"
         ),
         inline=False
     )
+    provider_lines = []
+    for provider_id, provider in providers.items():
+        if not isinstance(provider, dict):
+            continue
+        supports = ", ".join(provider.get("supports", []))
+        state_text = "켜짐" if provider.get("enabled", False) else "꺼짐"
+        provider_lines.append(f"- `{provider_id}`: {state_text} / {provider.get('type')} / {supports}")
+    if provider_lines:
+        embed.add_field(name="검색 Provider", value="\n".join(provider_lines)[:1024], inline=False)
+    schema_warnings = get_ai_tools_schema_warnings()
+    if schema_warnings:
+        embed.add_field(
+            name="설정 점검",
+            value="\n".join(f"- {warning}" for warning in schema_warnings)[:1024],
+            inline=False
+        )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="ai도구마이그레이션", description="[관리자] ai_tools.json을 현재 코드의 최신 스키마로 저장합니다.")
+async def ai_tools_migrate(interaction: discord.Interaction):
+    if not can_manage_ai_settings(interaction.user):
+        await interaction.response.send_message("❌ AI 설정을 변경할 권한이 없습니다.", ephemeral=True)
+        return
+
+    before = get_ai_tools_schema_warnings()
+    tools = get_ai_tools()
+    save_ai_tools(tools)
+    after = get_ai_tools_schema_warnings()
+    await interaction.response.send_message(
+        embed=build_status_embed(
+            "AI 도구 설정 마이그레이션 완료",
+            (
+                f"이전 경고: `{len(before)}`개\n"
+                f"현재 경고: `{len(after)}`개\n"
+                f"`{AI_TOOLS_FILE}`에 최신 검색 provider/cache 설정을 저장했습니다."
+            ),
+            "success"
+        ),
+        ephemeral=True
+    )
 
 @bot.tree.command(name="ai검색설정", description="AI 웹 검색 도구 사용 여부를 설정합니다.")
 @app_commands.describe(
-    사용="SearXNG 로컬 웹 검색을 켤지 선택합니다.",
+    사용="AI 검색 도구를 켤지 선택합니다.",
     자동검색="대화 중 검색 필요 표현을 감지해 자동 검색할지 선택합니다.",
     모르면검색="AI 답변이 불확실하면 한 번 웹 검색 후 다시 답변할지 선택합니다.",
+    기본provider="기본 검색 provider ID입니다. 예: searxng-local",
+    이미지provider="이미지 검색 provider ID입니다. 예: searxng-local",
+    상세검색="기본 검색에서도 결과 URL 본문 일부를 읽을지 선택합니다.",
     결과개수="검색 결과 최대 개수입니다. 1~10"
 )
 async def ai_search_settings(
@@ -3456,25 +4313,51 @@ async def ai_search_settings(
     사용: bool = True,
     자동검색: bool = False,
     모르면검색: bool = True,
+    기본provider: str = "searxng-local",
+    이미지provider: str = "searxng-local",
+    상세검색: bool = False,
     결과개수: int = AI_WEB_SEARCH_MAX_RESULTS
 ):
     if not can_manage_ai_settings(interaction.user):
         await interaction.response.send_message("❌ 서버 관리 권한 또는 오너 권한이 필요합니다.", ephemeral=True)
         return
     tools = get_ai_tools()
+    tools.setdefault("search", get_default_ai_tools()["search"])
+    providers = tools["search"].get("providers", {})
+    validation_errors = []
+    if 기본provider not in providers:
+        validation_errors.append(f"기본 provider `{기본provider}`")
+    if 이미지provider not in providers:
+        validation_errors.append(f"이미지 provider `{이미지provider}`")
+    if validation_errors:
+        await interaction.response.send_message(
+            "❌ 등록된 검색 provider ID만 사용할 수 있습니다.\n" + "\n".join(f"- {item}" for item in validation_errors),
+            ephemeral=True
+        )
+        return
+    tools["search"]["enabled"] = bool(사용)
+    tools["search"]["auto_search"] = bool(자동검색)
+    tools["search"]["search_on_uncertain"] = bool(모르면검색)
+    tools["search"]["default_provider"] = 기본provider
+    tools["search"]["image_provider"] = 이미지provider
+    tools["search"]["fetch_pages"] = bool(상세검색)
+    tools["search"]["max_results"] = max(1, min(int(결과개수), 10))
     tools.setdefault("web_search", {})
     tools["web_search"]["enabled"] = bool(사용)
     tools["web_search"]["auto_search"] = bool(자동검색)
     tools["web_search"]["search_on_uncertain"] = bool(모르면검색)
-    tools["web_search"]["max_results"] = max(1, min(int(결과개수), 10))
+    tools["web_search"]["max_results"] = tools["search"]["max_results"]
     save_ai_tools(tools)
     await interaction.response.send_message(
         f"✅ AI 웹 검색 설정을 저장했습니다.\n"
-        f"- 사용: `{tools['web_search']['enabled']}`\n"
-        f"- 자동검색: `{tools['web_search']['auto_search']}`\n"
-        f"- 모를 때 검색: `{tools['web_search']['search_on_uncertain']}`\n"
-        f"- 결과 개수: `{tools['web_search']['max_results']}`\n"
-        f"- SearXNG URL은 서버의 `ai_tools.json`에서 관리합니다.",
+        f"- 사용: `{tools['search']['enabled']}`\n"
+        f"- 자동검색: `{tools['search']['auto_search']}`\n"
+        f"- 모를 때 검색: `{tools['search']['search_on_uncertain']}`\n"
+        f"- 기본 provider: `{tools['search']['default_provider']}`\n"
+        f"- 이미지 provider: `{tools['search']['image_provider']}`\n"
+        f"- 기본 상세검색: `{tools['search']['fetch_pages']}`\n"
+        f"- 결과 개수: `{tools['search']['max_results']}`\n"
+        f"- Provider 상세 URL/API 키는 서버의 `ai_tools.json`에서 관리합니다.",
         ephemeral=True
     )
 
@@ -3599,28 +4482,55 @@ async def ai_history_search(
     except Exception as error:
         await interaction.followup.send(f"❌ AI 기록 검색 답변 실패:\n`{truncate_for_prompt(str(error), 1200)}`", ephemeral=비공개)
 
-@bot.tree.command(name="ai검색", description="SearXNG 로컬 웹 검색 결과를 바탕으로 AI가 답변합니다.")
+@bot.tree.command(name="ai검색", description="등록된 검색 provider로 웹/뉴스/이미지/영상 검색 후 AI가 답변합니다.")
 @app_commands.describe(
-    검색어="웹에서 검색할 내용입니다.",
+    검색어="검색할 내용입니다.",
+    종류="검색 종류입니다.",
+    provider="검색 provider ID입니다. auto 또는 searxng-local/brave-api/google-cse/serpapi-lens",
+    이미지url="Lens 검색에 사용할 공개 이미지 URL입니다.",
+    상세검색="검색 결과 URL의 본문 일부까지 읽어 답변 근거로 사용할지 선택합니다.",
     질문="검색 결과로 AI에게 물어볼 질문입니다. 비우면 검색어를 질문으로 사용합니다.",
     비공개="결과를 본인에게만 보낼지 선택합니다."
+)
+@app_commands.choices(
+    종류=[
+        app_commands.Choice(name="웹", value="web"),
+        app_commands.Choice(name="뉴스", value="news"),
+        app_commands.Choice(name="이미지", value="image"),
+        app_commands.Choice(name="영상", value="video"),
+        app_commands.Choice(name="렌즈/유사 이미지", value="lens")
+    ]
 )
 async def ai_web_search(
     interaction: discord.Interaction,
     검색어: str,
+    종류: str = "web",
+    provider: str = "auto",
+    이미지url: str = "",
+    상세검색: bool = False,
     질문: str = "",
     비공개: bool = False
 ):
     await interaction.response.defer(ephemeral=비공개, thinking=True)
-    tools = get_ai_tools()
-    web_config = tools.get("web_search", {})
-    results, error = await run_searxng_search(검색어, web_config)
-    if error:
-        await interaction.followup.send(f"❌ 웹 검색 실패: {error}", ephemeral=비공개)
+    search_type = normalize_search_type(종류)
+    image_url = 이미지url.strip() or None
+    if search_type == "lens" and not image_url:
+        await interaction.followup.send("❌ Lens 검색에는 `이미지url`이 필요합니다. 이미지 첨부 기반 Lens는 `@푸앙봇 렌즈검색 ...`으로 사용하세요.", ephemeral=비공개)
         return
-    context = format_web_search_context(검색어, results)
+    results, error = await run_search(검색어, search_type, provider_id=provider, image_url=image_url, fetch_pages=상세검색)
+    if error:
+        await interaction.followup.send(f"❌ 검색 실패: {error}", ephemeral=비공개)
+        return
+    search_config = get_search_config()
+    context = format_search_context(
+        검색어,
+        results,
+        search_type,
+        int(search_config.get("context_max_chars") or AI_SEARCH_CONTEXT_MAX_CHARS)
+    )
     config = get_ai_channel_config(interaction.guild_id, interaction.channel.id)
-    question = 질문 or f"`{검색어}` 검색 결과를 바탕으로 핵심을 정리해줘."
+    detail_note = "본문 발췌까지 포함한" if 상세검색 else "검색"
+    question = 질문 or f"`{검색어}` {search_type} {detail_note} 결과를 바탕으로 핵심을 정리해줘."
     prompt_text = f"{context}\n\n[사용자 요청]\n{question}"
     context_message = make_interaction_ai_context(interaction, question)
     try:
@@ -3896,8 +4806,9 @@ async def volume_setup(interaction: discord.Interaction, 음악볼륨: int = Non
     if 음악볼륨 is not None:
         music_percent = clamp_percent(음악볼륨, 0, 200)
         state.volume = music_percent / 100
-        if state.music_source is not None:
-            state.music_source.volume = state.volume
+        active_music_source = get_active_music_source(state)
+        if active_music_source is not None:
+            active_music_source.volume = state.volume
         changed.append(f"기본 음악 볼륨: **{music_percent}%**")
 
     if tts중음악볼륨 is not None:
@@ -3982,21 +4893,52 @@ async def extract_youtube_info(query):
     with youtube_dl.YoutubeDL(get_ytdl_options()) as ydl:
         return await loop.run_in_executor(None, lambda: ydl.extract_info(query, download=False))
 
+def get_song_page_url(info):
+    if info.get("webpage_url"):
+        return info["webpage_url"]
+    if info.get("original_url"):
+        return info["original_url"]
+    return info.get("url")
+
 def song_from_info(info, requester):
     return Song(
         url=info['url'],
         title=info['title'],
         duration=info.get('duration'),
         thumbnail=info.get('thumbnail'),
-        requester=requester
+        requester=requester,
+        page_url=get_song_page_url(info)
     )
+
+async def refresh_song_stream_url(song):
+    page_url = getattr(song, "page_url", None)
+    if not page_url or page_url == song.url:
+        return
+    try:
+        refreshed = await extract_youtube_info(page_url)
+        if "entries" in refreshed:
+            entries = [entry for entry in refreshed.get("entries", []) if entry]
+            if entries:
+                refreshed = entries[0]
+        if refreshed.get("url"):
+            song.url = refreshed["url"]
+        song.title = refreshed.get("title") or song.title
+        song.duration = refreshed.get("duration") or song.duration
+        song.thumbnail = refreshed.get("thumbnail") or song.thumbnail
+        song.page_url = get_song_page_url(refreshed) or page_url
+    except Exception as e:
+        print(f"스트림 URL 갱신 실패({truncate_text(song.title, 80)}): {e}")
 
 async def enqueue_song_for_interaction(interaction, song, response_channel, ephemeral=False):
     state = get_state(interaction.guild_id)
     state.queue.append(song)
 
-    if not state.current_song:
+    started_now = can_start_music_now(state)
+    if started_now:
         await play_next(interaction.guild_id, response_channel)
+        started_now = state.current_song is song
+
+    if started_now:
         embed = build_embed(
             title="재생 시작",
             description=f"**{truncate_text(song.title, 180)}**",
@@ -4126,36 +5068,6 @@ async def show_queue_command(interaction: discord.Interaction):
         ephemeral=True
     )
 
-@bot.tree.command(name="대기열삭제", description="대기열에서 특정 번호의 노래를 삭제합니다.")
-@app_commands.describe(index="삭제할 노래의 번호 (대기열 명렁어로 확인)")
-async def remove_from_queue(interaction: discord.Interaction, index: int):
-    state = get_state(interaction.guild_id)
-    
-    if not state.queue:
-        await interaction.response.send_message("❌ 대기열이 비어있습니다.", ephemeral=True)
-        return
-        
-    if index < 1 or index > len(state.queue):
-        await interaction.response.send_message(f"❌ 올바른 번호를 입력해주세요. (1 ~ {len(state.queue)} 사이)", ephemeral=True)
-        return
-        
-    removed_song = state.queue.pop(index - 1)
-    state.queue_page = clamp_queue_page(state, state.queue_page)
-    await update_controller_message(interaction.guild_id)
-    await interaction.response.send_message(f"🗑️ 대기열에서 **{removed_song.title}** 노래를 쏙 뺐습니다!")
-
-@bot.tree.command(name="대기열섞기", description="현재 대기열의 노래 순서를 무작위로 셔플합니다.")
-async def shuffle_queue(interaction: discord.Interaction):
-    state = get_state(interaction.guild_id)
-    
-    if len(state.queue) < 2:
-        await interaction.response.send_message("❌ 섞을 노래가 2곡 이상 필요합니다.", ephemeral=True)
-        return
-        
-    random.shuffle(state.queue)
-    state.queue_page = clamp_queue_page(state, state.queue_page)
-    await update_controller_message(interaction.guild_id)
-    await interaction.response.send_message("🔀 **대기열을 무작위로 섞었습니다!** `/대기열` 명령어로 바뀐 순서를 확인해보세요.")
 # -----------------------------------
 
 @bot.tree.command(name="미니푸앙", description="푸앙봇의 시그니처 텍스트 아트를 출력합니다.")
@@ -4224,13 +5136,21 @@ async def mc_command(interaction: discord.Interaction, command: str):
 
     try:
         # 마크 서버(RCON)에 접속해서 명령어를 쏘고 대답을 받아옵니다.
-        with MCRcon("127.0.0.1", RCON_PASSWORD, port=25575) as mcr:
+        with open_rcon() as mcr:
             response = mcr.command(command)
             await interaction.response.send_message(f"💻 **서버 응답:**\n```\n{response}\n```")
     except Exception as e:
         await interaction.response.send_message(f"❌ 서버 연결 실패: {e}", ephemeral=True)
 
+def validate_runtime_config():
+    for warning in get_ai_tools_schema_warnings():
+        print(f"⚠️ [AI 설정] {warning}")
+    rcon_config = get_rcon_config()
+    if not rcon_config["password"]:
+        print(f"⚠️ [RCON] `{rcon_config['password_env']}` 환경 변수가 없어 서버 RCON 명령은 실패할 수 있습니다.")
+
 # 봇 실행
+validate_runtime_config()
 with open('token.txt', 'r') as f:
     TOKEN = f.read().strip()
 

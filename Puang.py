@@ -2614,16 +2614,28 @@ def get_active_music_source(state):
 def start_mixer_if_needed(guild_id, interaction_channel=None, music_source=None):
     state = get_state(guild_id)
     voice = state.voice_client
-    if not voice or not voice.is_connected():
-        return False
+    
+    if voice is None or getattr(voice, 'is_connected', lambda: False)() is False:
+        guild = bot.get_guild(guild_id)
+        if guild and guild.voice_client and getattr(guild.voice_client, 'is_connected', lambda: False)():
+            state.voice_client = guild.voice_client
+            voice = state.voice_client
+        else:
+            return False
 
     if interaction_channel is not None:
         state.playback_channel = interaction_channel
 
     if voice.is_playing() or voice.is_paused():
-        if music_source is not None:
-            return False
-        return True
+        if getattr(state, "mixer", None) is not None:
+            if music_source is not None:
+                return False
+            return True
+        else:
+            try:
+                voice.stop()
+            except Exception:
+                pass
 
     state.mixer = MixedAudioSource(state, music_source)
     state.music_source = music_source
@@ -2712,13 +2724,15 @@ async def add_xp(user: discord.Member, amount: int, channel: discord.TextChannel
 # --- [수정: TTS 처리 백그라운드 엔진 (gTTS & Edge-TTS 하이브리드)] ---
 async def process_tts_queue(guild: discord.Guild):
     state = get_state(guild.id)
-    vc = guild.voice_client
     
     while not state.tts_queue.empty():
-        payload = await state.tts_queue.get()
-        
-        if not vc or not vc.is_connected():
+        vc = guild.voice_client
+        if vc and getattr(vc, 'is_connected', lambda: False)():
+            state.voice_client = vc
+        else:
             break
+            
+        payload = await state.tts_queue.get()
 
         try:
             filename = f"tts_{uuid.uuid4().hex}.mp3"

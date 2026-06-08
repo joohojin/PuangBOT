@@ -2528,12 +2528,13 @@ class MixedAudioSource(discord.AudioSource):
         self.closed = True
         self._cleanup_music()
         self._cleanup_active_tts()
-        while True:
-            try:
-                item = self.state.tts_sources.get_nowait()
-            except Empty:
-                break
-            self._cleanup_tts_item(item)
+        if self.state.mixer is self or self.state.mixer is None:
+            while True:
+                try:
+                    item = self.state.tts_sources.get_nowait()
+                except Empty:
+                    break
+                self._cleanup_tts_item(item)
 
     def _smooth_music_multiplier(self, target):
         step = 0.08
@@ -2629,6 +2630,10 @@ def start_mixer_if_needed(guild_id, interaction_channel=None, music_source=None)
     if voice.is_playing() or voice.is_paused():
         if getattr(state, "mixer", None) is not None:
             if music_source is not None:
+                if state.mixer.music_source is None:
+                    state.mixer.music_source = music_source
+                    state.music_source = music_source
+                    return True
                 return False
             return True
         else:
@@ -2637,13 +2642,15 @@ def start_mixer_if_needed(guild_id, interaction_channel=None, music_source=None)
             except Exception:
                 pass
 
-    state.mixer = MixedAudioSource(state, music_source)
+    mixer_instance = MixedAudioSource(state, music_source)
+    state.mixer = mixer_instance
     state.music_source = music_source
 
     def after_mixer(error):
         if error:
             print(f"믹서 오류: {error}")
-        state.mixer = None
+        if getattr(state, "mixer", None) is mixer_instance:
+            state.mixer = None
 
         if state.current_song or state.queue:
             channel = interaction_channel or state.playback_channel
@@ -2661,10 +2668,13 @@ async def continue_playback_after_mixer(guild_id, interaction_channel):
             return
         if not voice.is_playing() and not voice.is_paused():
             break
+        if getattr(state, "mixer", None) is not None and state.mixer.music_source is None:
+            break
         await asyncio.sleep(0.1)
     if voice and (voice.is_playing() or voice.is_paused()):
-        print("다음 곡 재생 대기 실패: 이전 mixer가 아직 재생 중으로 표시됩니다.")
-        return
+        if getattr(state, "mixer", None) is None or state.mixer.music_source is not None:
+            print("다음 곡 재생 대기 실패: 이전 mixer가 아직 재생 중으로 표시됩니다.")
+            return
 
     try:
         if state.current_song or state.queue:

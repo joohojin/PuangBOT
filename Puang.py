@@ -1764,10 +1764,19 @@ async def maybe_retry_ai_with_self_search(
     retry_route = f"{retry_route} / 모르는 지식 자동 {inferred_type} 검색"
     return retry_answer, retry_route, f"모르는 지식으로 판단해 {inferred_type} 검색 결과 {len(results)}개를 추가 참고했습니다."
 
-def strip_bot_mention(content):
+def strip_bot_mention(content, guild=None):
+    content = content or ""
     if not bot.user:
         return content.strip()
-    return re.sub(rf"<@!?{bot.user.id}>", "", content).strip()
+    content = re.sub(rf"<@!?{bot.user.id}>", "", content)
+    # clean_content에서는 멘션이 "@이름" 형태로 바뀌므로 그 형태도 제거합니다.
+    names = {bot.user.name, getattr(bot.user, "display_name", "")}
+    me = guild.me if guild else None
+    if me is not None:
+        names.add(me.display_name)
+    for name in sorted((n for n in names if n), key=len, reverse=True):
+        content = content.replace(f"@{name}", "")
+    return content.strip()
 
 def is_ai_triggered(message, config):
     if not config.get("enabled"):
@@ -2033,7 +2042,11 @@ async def call_openai_compatible_chat(config, provider, profile, message, prompt
             if response.status >= 400:
                 raise RuntimeError(f"LLM 서버 오류 {response.status}: {body[:500]}")
             data = json.loads(body)
-    return data["choices"][0]["message"]["content"].strip()
+    choices = data.get("choices") or []
+    content = (choices[0].get("message") or {}).get("content") if choices else None
+    if not content:
+        raise RuntimeError("LLM 응답에 choices[0].message.content가 없습니다.")
+    return content.strip()
 
 async def call_ollama_native_chat(config, provider, profile, message, prompt_text, image_payloads, memory_content, use_images=False):
     base_url = normalize_ai_base_url(provider.get("base_url"), "ollama")
@@ -2344,8 +2357,15 @@ def check_and_setup_env():
 # 봇이 켜질 때 무조건 환경 세팅 먼저 실행
 check_and_setup_env()
 
+def resolve_ffmpeg_path():
+    local_name = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
+    if os.path.exists(local_name):
+        return os.path.abspath(local_name)
+    # 폴더에 없으면 시스템 PATH에 설치된 ffmpeg를 사용합니다.
+    return shutil.which("ffmpeg") or os.path.abspath(local_name)
+
 # 다운받은 FFmpeg의 절대 경로 저장 (재생 오류 원천 차단)
-FFMPEG_PATH = os.path.abspath("ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg")
+FFMPEG_PATH = resolve_ffmpeg_path()
 # ==========================================
 
 
@@ -2740,22 +2760,31 @@ async def process_tts_queue(guild: discord.Guild):
         if vc and getattr(vc, 'is_connected', lambda: False)():
             state.voice_client = vc
         else:
+            # 음성 연결이 끊겼으면 남은 문장을 버려서, 다음에 연결될 때 옛날 채팅을 몰아서 읽지 않게 합니다.
+            while not state.tts_queue.empty():
+                try:
+                    state.tts_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
             break
-            
-        payload = await state.tts_queue.get()
 
+        payload = await state.tts_queue.get()
+        if not (payload.get("text") or "").strip():
+            continue
+
+        filename = None
         try:
             filename = f"tts_{uuid.uuid4().hex}.mp3"
-            
+
             # 1. 유저 설정에 따라 엔진 분기 처리
             if payload.get("engine") == "edge":
                 communicate = edge_tts.Communicate(payload["text"], payload["voice"], pitch=payload["pitch"])
                 await communicate.save(filename)
             else:
-                # 기본 엔진 (gTTS)
+                # 기본 엔진 (gTTS) - 네트워크 요청이 봇 전체를 멈추지 않도록 별도 스레드에서 실행
                 tts = gTTS(text=payload["text"], lang='ko')
-                tts.save(filename)
-            
+                await asyncio.to_thread(tts.save, filename)
+
             # 2. 믹서에 TTS 소스를 추가합니다. 음악은 끊기지 않고 자동으로 볼륨만 낮아집니다.
             tts_source = discord.FFmpegPCMAudio(filename, executable=FFMPEG_PATH)
             tts_source = discord.PCMVolumeTransformer(tts_source, volume=state.tts_volume)
@@ -2763,15 +2792,19 @@ async def process_tts_queue(guild: discord.Guild):
             filename = None
 
             if not start_mixer_if_needed(guild.id):
-                item = state.tts_sources.get_nowait()
                 try:
-                    item["source"].cleanup()
-                except Exception:
-                    pass
-                try:
-                    os.remove(item["filename"])
-                except Exception:
-                    pass
+                    item = state.tts_sources.get_nowait()
+                except Empty:
+                    item = None
+                if item:
+                    try:
+                        item["source"].cleanup()
+                    except Exception:
+                        pass
+                    try:
+                        os.remove(item["filename"])
+                    except Exception:
+                        pass
 
         except Exception as e:
             print(f"TTS 에러: {e}")
@@ -3372,7 +3405,7 @@ async def on_ready():
     print(f'✅ 푸앙봇 V4.0 로그인 완료! 푸앙푸앙: {bot.user}')
 
 def build_ai_memory_text(message):
-    content = strip_bot_mention(message.clean_content or message.content)
+    content = strip_bot_mention(message.clean_content or message.content, message.guild)
     attachment_names = ", ".join(a.filename for a in message.attachments)
     if attachment_names:
         content = (content + "\n" if content else "") + f"[첨부파일: {attachment_names}]"
@@ -3509,8 +3542,22 @@ async def probe_ai_model(config, model_name):
     return f"{status} / Provider: {provider.get('id')} ({provider_type}) / 기능: {caps}"
 
 async def handle_ai_reply(message, config, memory_content):
+    # create_task로 실행되므로, 예외를 여기서 잡지 않으면 조용히 사라집니다.
+    try:
+        await handle_ai_reply_inner(message, config, memory_content)
+    except Exception as error:
+        print(f"AI 응답 처리 실패: {error}")
+        try:
+            await message.reply(
+                f"❌ AI 응답 처리 중 오류가 발생했어요:\n`{truncate_for_prompt(str(error), 500)}`",
+                mention_author=False
+            )
+        except Exception:
+            pass
+
+async def handle_ai_reply_inner(message, config, memory_content):
     async with message.channel.typing():
-        base_content = strip_bot_mention(message.clean_content or message.content)
+        base_content = strip_bot_mention(message.clean_content or message.content, message.guild)
         user_content, tool_contexts, tool_notes, used_tools = await build_ai_tool_context(message, config, base_content)
         text_blocks, image_payloads, image_fallbacks, notes = await process_ai_attachments(message.attachments)
 
@@ -3621,6 +3668,67 @@ async def maybe_handle_ai_message(message):
     if is_ai_triggered(message, config):
         asyncio.create_task(handle_ai_reply(message, config, memory_content))
 
+TTS_MAX_TEXT_LENGTH = 200
+# http(s)://, www. 로 시작하는 링크 (디스코드의 <https://...> 형태 포함)
+TTS_URL_PATTERN = re.compile(r"<?(?:https?://|www\.)\S+>?", re.IGNORECASE)
+# 커스텀 이모지 <:name:id>, <a:name:id>
+TTS_CUSTOM_EMOJI_PATTERN = re.compile(r"<a?:\w+:\d+>")
+# 타임스탬프 <t:1234567890:R>
+TTS_TIMESTAMP_PATTERN = re.compile(r"<t:\d+(?::[a-zA-Z])?>")
+
+def build_tts_text(content):
+    """TTS로 읽을 문장에서 링크(gif 등)와 디스코드 전용 표기를 제거합니다."""
+    text = content or ""
+    text = TTS_URL_PATTERN.sub(" ", text)
+    text = TTS_CUSTOM_EMOJI_PATTERN.sub(" ", text)
+    text = TTS_TIMESTAMP_PATTERN.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > TTS_MAX_TEXT_LENGTH:
+        text = text[:TTS_MAX_TEXT_LENGTH].rstrip() + " 이하 생략"
+    return text
+
+async def maybe_queue_message_tts(message):
+    if not message.guild:
+        return
+    user_settings = load_tts().get(str(message.author.id), {})
+    if not user_settings.get("enabled", False):
+        return
+    author_voice = getattr(message.author, "voice", None)
+    if not author_voice or not author_voice.channel:
+        return
+
+    # 링크/이모지만 있는 메시지(gif 등)는 읽지 않습니다.
+    content = build_tts_text(message.clean_content or message.content)
+    if not content:
+        return
+
+    state = get_state(message.guild.id)
+    if not message.guild.voice_client:
+        try:
+            await author_voice.channel.connect(timeout=20.0, self_deaf=True)
+        except Exception as error:
+            print(f"TTS 음성 채널 연결 실패: {error}")
+            return
+    state.voice_client = message.guild.voice_client
+
+    if user_settings.get("say_name", "yes") == "yes" and state.last_tts_user != message.author.id:
+        text_to_read = f"{message.author.display_name}님의 말. {content}"
+    else:
+        text_to_read = content
+    state.last_tts_user = message.author.id
+
+    # 엔진과 부가 설정을 큐에 담아서 전송 (엔진 기본값은 gtts)
+    payload = {
+        "text": text_to_read,
+        "engine": user_settings.get("engine", "gtts"),
+        "voice": user_settings.get("voice", "ko-KR-SunHiNeural"),
+        "pitch": user_settings.get("pitch", "+0Hz")
+    }
+    await state.tts_queue.put(payload)
+
+    if state.tts_task is None or state.tts_task.done():
+        state.tts_task = asyncio.create_task(process_tts_queue(message.guild))
+
 # 💡 채팅을 치면 경험치 획득 (글자 수에 비례하되 최대 20 제한)
 @bot.event
 async def on_message(message: discord.Message):
@@ -3631,41 +3739,10 @@ async def on_message(message: discord.Message):
         print(f"AI 채널 기록 인덱싱 실패: {error}")
 
     # --- [수정: 개인별 TTS 감지 및 옵션 적용 로직] ---
-    tts_data = load_tts()
-    uid = str(message.author.id)
-    user_settings = tts_data.get(uid, {})
-    
-    if user_settings.get("enabled", False) and message.author.voice:
-        guild_id = message.guild.id
-        state = get_state(guild_id)
-        
-        if not message.guild.voice_client:
-            await message.author.voice.channel.connect(timeout=20.0, self_deaf=True)
-            state.voice_client = message.guild.voice_client
-            
-        say_name = user_settings.get("say_name", "yes")
-        
-        if say_name == "yes":
-            if state.last_tts_user == message.author.id:
-                text_to_read = message.content 
-            else:
-                text_to_read = f"{message.author.display_name}님의 말. {message.content}"
-        else:
-            text_to_read = message.content
-            
-        state.last_tts_user = message.author.id 
-        
-        # 엔진과 부가 설정을 큐에 담아서 전송 (엔진 기본값은 gtts)
-        payload = {
-            "text": text_to_read,
-            "engine": user_settings.get("engine", "gtts"),
-            "voice": user_settings.get("voice", "ko-KR-SunHiNeural"),
-            "pitch": user_settings.get("pitch", "+0Hz")
-        }
-        await state.tts_queue.put(payload)
-        
-        if state.tts_task is None or state.tts_task.done():
-            state.tts_task = asyncio.create_task(process_tts_queue(message.guild))
+    try:
+        await maybe_queue_message_tts(message)
+    except Exception as error:
+        print(f"TTS 처리 실패: {error}")
     # -----------------------------------
 
     await maybe_handle_ai_message(message)
@@ -4785,8 +4862,13 @@ async def tts_test(interaction: discord.Interaction, 문장: str = "푸앙봇 TT
         await interaction.response.send_message("❌ 음성 채널에 먼저 들어가주세요.", ephemeral=True)
         return
 
-    text = truncate_text(문장, 120)
+    text = build_tts_text(truncate_text(문장, 120))
+    if not text:
+        await interaction.response.send_message("❌ 읽을 수 있는 문장이 없어요. (링크/이모지는 읽지 않습니다)", ephemeral=True)
+        return
     state = get_state(interaction.guild_id)
+    # 음성 연결은 3초 넘게 걸릴 수 있어 먼저 응답을 예약합니다.
+    await interaction.response.defer(ephemeral=True)
 
     try:
         if not interaction.guild.voice_client:
@@ -4794,7 +4876,7 @@ async def tts_test(interaction: discord.Interaction, 문장: str = "푸앙봇 TT
         elif not interaction.guild.voice_client.is_connected():
             await interaction.guild.voice_client.move_to(interaction.user.voice.channel)
     except Exception:
-        await interaction.response.send_message("❌ 음성 채널 연결에 실패했어요.", ephemeral=True)
+        await interaction.followup.send("❌ 음성 채널 연결에 실패했어요.", ephemeral=True)
         return
 
     state.voice_client = interaction.guild.voice_client
@@ -4809,7 +4891,7 @@ async def tts_test(interaction: discord.Interaction, 문장: str = "푸앙봇 TT
     if state.tts_task is None or state.tts_task.done():
         state.tts_task = asyncio.create_task(process_tts_queue(interaction.guild))
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=build_status_embed("TTS 테스트 시작", f"`{text}`", "tts"),
         ephemeral=True
     )
@@ -4861,7 +4943,7 @@ async def update_bot(interaction: discord.Interaction):
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: subprocess.run(["git", "pull"], check=True, capture_output=True, text=True))
         
-        await interaction.followup.send("✅ **업데이트 완료!** 봇을 재시작합니다.\n```\n" + result.stdout + "\n```")
+        await interaction.followup.send("✅ **업데이트 완료!** 봇을 재시작합니다.\n```\n" + truncate_text(result.stdout, 1800) + "\n```")
         
         # 🌟 해결 1: 디스코드에 메시지가 완전히 전송될 수 있도록 1초 대기합니다.
         await asyncio.sleep(1)
@@ -4870,7 +4952,7 @@ async def update_bot(interaction: discord.Interaction):
         os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0])])
         
     except subprocess.CalledProcessError as e:
-        await interaction.followup.send(f"❌ **Git Pull 실패:**\n```\n{e.stderr}\n```")
+        await interaction.followup.send(f"❌ **Git Pull 실패:**\n```\n{truncate_text(e.stderr, 1800)}\n```")
     except FileNotFoundError:
         await interaction.followup.send("❌ **[WinError 2] Git이 설치되어 있지 않거나 환경 변수에 없습니다!**")
     except Exception as e:
@@ -4878,17 +4960,25 @@ async def update_bot(interaction: discord.Interaction):
 
 @bot.tree.command(name="입장", description="봇을 현재 음성 채널로 부릅니다.")
 async def join(interaction: discord.Interaction):
-    if interaction.user.voice:
-        channel = interaction.user.voice.channel
+    if not interaction.user.voice:
+        await interaction.response.send_message("❌ 음성 채널에 먼저 들어가주세요!", ephemeral=True)
+        return
+
+    # 음성 연결은 3초 넘게 걸릴 수 있어 먼저 응답을 예약합니다.
+    await interaction.response.defer()
+    channel = interaction.user.voice.channel
+    try:
         if interaction.guild.voice_client:
             await interaction.guild.voice_client.move_to(channel)
         else:
             await channel.connect(timeout=20.0, self_deaf=True)
-        state = get_state(interaction.guild_id)
-        state.voice_client = interaction.guild.voice_client
-        await interaction.response.send_message("🔊 **스피커 연결 완료!**")
-    else:
-        await interaction.response.send_message("❌ 음성 채널에 먼저 들어가주세요!", ephemeral=True)
+    except Exception as e:
+        print(f"음성 채널 연결 실패: {e}")
+        await interaction.followup.send("❌ 음성 채널 연결에 실패했어요.")
+        return
+    state = get_state(interaction.guild_id)
+    state.voice_client = interaction.guild.voice_client
+    await interaction.followup.send("🔊 **스피커 연결 완료!**")
 
 @bot.tree.command(name="퇴장", description="봇을 내보냅니다.")
 async def leave(interaction: discord.Interaction):
@@ -5060,7 +5150,11 @@ async def play(interaction: discord.Interaction, search: str):
         if is_url:
             info = await extract_youtube_info(search)
             if 'entries' in info:
-                info = info['entries'][0]
+                entries = [entry for entry in info.get('entries') or [] if entry]
+                if not entries:
+                    await interaction.followup.send("❌ 재생할 수 있는 영상을 찾지 못했어요.", ephemeral=True)
+                    return
+                info = entries[0]
             await enqueue_song_for_interaction(interaction, song_from_info(info, interaction.user), interaction.channel)
             return
 
@@ -5158,13 +5252,20 @@ async def mc_command(interaction: discord.Interaction, command: str):
         await interaction.response.send_message("❌ 관리자만 가능합니다.", ephemeral=True)
         return
 
-    try:
+    await interaction.response.defer()
+
+    def run_rcon_command():
         # 마크 서버(RCON)에 접속해서 명령어를 쏘고 대답을 받아옵니다.
         with open_rcon() as mcr:
-            response = mcr.command(command)
-            await interaction.response.send_message(f"💻 **서버 응답:**\n```\n{response}\n```")
+            return mcr.command(command)
+
+    try:
+        # RCON은 동기 통신이라 봇이 멈추지 않도록 별도 스레드에서 실행합니다.
+        response = await asyncio.to_thread(run_rcon_command)
     except Exception as e:
-        await interaction.response.send_message(f"❌ 서버 연결 실패: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ 서버 연결 실패: {truncate_text(e, 1800)}", ephemeral=True)
+        return
+    await interaction.followup.send(f"💻 **서버 응답:**\n```\n{truncate_text(response, 1800) or '(응답 없음)'}\n```")
 
 def validate_runtime_config():
     for warning in get_ai_tools_schema_warnings():
